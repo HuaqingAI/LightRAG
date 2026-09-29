@@ -42,9 +42,9 @@ export default function DeleteDocumentsDialog({ selectedDocIds, onDocumentsDelet
   const { t } = useTranslation()
   const [open, setOpen] = useState(false)
   const [confirmText, setConfirmText] = useState('')
-  const [deleteFile, setDeleteFile] = useState(false)
+  const [deleteFile, setDeleteFile] = useState(true)
   const [isDeleting, setIsDeleting] = useState(false)
-  const [deleteLLMCache, setDeleteLLMCache] = useState(false)
+  const [deleteLLMCache, setDeleteLLMCache] = useState(true)
   const isConfirmEnabled = confirmText.toLowerCase() === 'yes' && !isDeleting
 
   // Reset state when dialog closes - handled in onOpenChange to avoid setState in effect
@@ -52,8 +52,8 @@ export default function DeleteDocumentsDialog({ selectedDocIds, onDocumentsDelet
     setOpen(newOpen)
     if (!newOpen) {
       setConfirmText('')
-      setDeleteFile(false)
-      setDeleteLLMCache(false)
+      setDeleteFile(true)
+      setDeleteLLMCache(true)
       setIsDeleting(false)
     }
   }, [])
