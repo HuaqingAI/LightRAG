@@ -171,6 +171,10 @@
         "scanProgressFailed": "获取扫描进度失败\n{{error}}"
       },
       "fileNameLabel": "文件名",
+      "fileNameSearchPlaceholder": "按文件名筛选",
+      "fileNameSearchLabel": "按文件名筛选",
+      "fileNameSearchTooltip": "按文件名筛选",
+      "clearFileNameSearchTooltip": "清除文件名筛选",
       "showButton": "显示",
       "hideButton": "隐藏",
       "showFileNameTooltip": "显示文件名",

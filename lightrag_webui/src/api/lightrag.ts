@@ -321,6 +321,7 @@ export type TrackStatusResponse = {
 export type DocumentsRequest = {
   status_filter?: DocStatus | null
   status_filters?: DocStatus[] | null
+  file_name?: string | null
   page: number
   page_size: number
   sort_field: 'created_at' | 'updated_at' | 'id' | 'file_path'

@@ -120,6 +120,82 @@ def test_documents_paginated_status_filters_override_status_filter():
     ]
 
 
+class _FileNameDocStatusStorage(_FakeDocStatusStorage):
+    supports_file_name_filter = True
+
+    def __init__(self):
+        super().__init__()
+        self.file_name_calls = []
+
+    async def get_docs_paginated(
+        self,
+        status_filter=None,
+        status_filters=None,
+        page=1,
+        page_size=50,
+        sort_field="updated_at",
+        sort_direction="desc",
+        file_name=None,
+    ):
+        self.file_name_calls.append(file_name)
+        selected_statuses = DocStatusStorage.resolve_status_filter_values(
+            status_filter=status_filter,
+            status_filters=status_filters,
+        )
+        documents = [
+            (doc_id, doc)
+            for doc_id, doc in self.docs.items()
+            if (selected_statuses is None or doc.status.value in selected_statuses)
+            and (
+                file_name is None
+                or file_name.lower() in (doc.file_path or "").lower()
+            )
+        ]
+        return documents[:page_size], len(documents)
+
+
+def _file_name_client(storage):
+    app = FastAPI()
+    app.include_router(
+        create_document_routes(
+            SimpleNamespace(doc_status=storage),
+            SimpleNamespace(),
+            api_key="test-key",
+        )
+    )
+    return TestClient(app)
+
+
+def test_documents_paginated_filters_by_trimmed_file_name_and_status():
+    storage = _FileNameDocStatusStorage()
+    response = _file_name_client(storage).post(
+        "/documents/paginated",
+        headers=_headers,
+        json={
+            "status_filters": ["parsing", "analyzing"],
+            "file_name": "  PARS  ",
+            "page": 1,
+            "page_size": 10,
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["pagination"]["total_count"] == 1
+    assert [doc["id"] for doc in payload["documents"]] == ["parsing-doc"]
+    assert storage.file_name_calls == ["PARS"]
+
+
+def test_documents_paginated_rejects_file_name_for_unsupported_backend():
+    response = _client.post(
+        "/documents/paginated",
+        headers=_headers,
+        json={"file_name": "report", "page": 1, "page_size": 10},
+    )
+
+    assert response.status_code == 501
+
+
 # --- internal metadata stripping ------------------------------------------
 
 

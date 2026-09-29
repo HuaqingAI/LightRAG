@@ -1201,6 +1201,8 @@ class DocumentsRequest(BaseModel):
     Attributes:
         status_filter: Legacy single-status filter, ignored when status_filters is set
         status_filters: Filter by multiple document statuses, None for all statuses
+        file_name: Optional case-insensitive substring of the canonical file name;
+            empty values are treated as no filter
         page: Page number (1-based)
         page_size: Number of documents per page (10-200)
         sort_field: Field to sort by ('created_at', 'updated_at', 'id', 'file_path')
@@ -1214,6 +1216,14 @@ class DocumentsRequest(BaseModel):
     status_filters: Optional[List[DocStatus]] = Field(
         default=None, description="Filter by multiple document statuses"
     )
+    file_name: Optional[str] = Field(
+        default=None,
+        max_length=255,
+        description=(
+            "Case-insensitive substring of the canonical file name; "
+            "empty values disable the filter"
+        ),
+    )
     page: int = Field(default=1, ge=1, description="Page number (1-based)")
     page_size: int = Field(
         default=50, ge=10, le=200, description="Number of documents per page (10-200)"
@@ -1225,10 +1235,22 @@ class DocumentsRequest(BaseModel):
         default="desc", description="Sort direction"
     )
 
+    @field_validator("file_name", mode="before")
+    @classmethod
+    def normalize_file_name(cls, value: Optional[str]) -> Optional[str]:
+        """Trim the UI search value and collapse blank input to no filter."""
+        if value is None:
+            return None
+        if isinstance(value, str):
+            normalized = value.strip()
+            return normalized or None
+        return value
+
     model_config = ConfigDict(
         json_schema_extra={
             "example": {
                 "status_filters": ["PREPROCESSED", "PARSING", "ANALYZING"],
+                "file_name": "report",
                 "page": 1,
                 "page_size": 50,
                 "sort_field": "updated_at",
@@ -6452,6 +6474,31 @@ def create_document_routes(
         )
         workspace = getattr(rag, "workspace", None)
 
+        # ``file_name`` is an optional backend capability.  Keep the legacy
+        # call shape for every backend when the filter is absent; when it is
+        # requested, fail explicitly instead of silently returning an
+        # unfiltered page or passing an unknown keyword to an older backend.
+        doc_query_kwargs = {
+            "status_filter": request.status_filter,
+            "status_filters": request.status_filters,
+            "page": request.page,
+            "page_size": request.page_size,
+            "sort_field": request.sort_field,
+            "sort_direction": request.sort_direction,
+        }
+        if request.file_name is not None:
+            if not bool(
+                getattr(type(rag.doc_status), "supports_file_name_filter", False)
+            ):
+                raise HTTPException(
+                    status_code=501,
+                    detail=(
+                        "The configured doc_status backend does not support "
+                        "file-name filtering."
+                    ),
+                )
+            doc_query_kwargs["file_name"] = request.file_name
+
         performance_timing_log(
             "[documents/paginated][%s] Request start workspace=%s status_filter=%s page=%s page_size=%s sort_field=%s sort_direction=%s",
             trace_id,
@@ -6497,14 +6544,7 @@ def create_document_routes(
             docs_task = asyncio.create_task(
                 _timed_call(
                     "get_docs_paginated",
-                    rag.doc_status.get_docs_paginated(
-                        status_filter=request.status_filter,
-                        status_filters=request.status_filters,
-                        page=request.page,
-                        page_size=request.page_size,
-                        sort_field=request.sort_field,
-                        sort_direction=request.sort_direction,
-                    ),
+                    rag.doc_status.get_docs_paginated(**doc_query_kwargs),
                 )
             )
             status_counts_task = asyncio.create_task(

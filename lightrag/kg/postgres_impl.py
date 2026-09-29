@@ -5458,6 +5458,7 @@ class PGDocStatusStorage(DocStatusStorage):
     db: PostgreSQLDB = field(default=None)
 
     supports_strict_point_reads: ClassVar[bool] = True
+    supports_file_name_filter: ClassVar[bool] = True
 
     # Bounded upper limit on the sample of conflicting doc IDs surfaced by the
     # source-conflict listing/repair APIs — never materialize the whole set.
@@ -6594,6 +6595,7 @@ class PGDocStatusStorage(DocStatusStorage):
         page_size: int = 50,
         sort_field: str = "updated_at",
         sort_direction: str = "desc",
+        file_name: str | None = None,
     ) -> tuple[list[tuple[str, DocProcessingStatus]], int]:
         """Get documents with pagination support
 
@@ -6603,6 +6605,7 @@ class PGDocStatusStorage(DocStatusStorage):
             page_size: Number of documents per page (10-200)
             sort_field: Field to sort by ('created_at', 'updated_at', 'id')
             sort_direction: Sort direction ('asc' or 'desc')
+            file_name: Optional case-insensitive substring of the file name
 
         Returns:
             Tuple of (list of (doc_id, DocProcessingStatus) tuples, total_count)
@@ -6612,6 +6615,9 @@ class PGDocStatusStorage(DocStatusStorage):
             status_filter=status_filter,
             status_filters=status_filters,
         )
+        file_name = file_name.strip() if file_name is not None else None
+        if not file_name:
+            file_name = None
         status_filter_value = status_filter.value if status_filter is not None else None
 
         performance_timing_log(
@@ -6650,13 +6656,22 @@ class PGDocStatusStorage(DocStatusStorage):
         params = {"workspace": self.workspace}
         param_count = 1
 
-        # Build WHERE clause with parameterized query
+        # Build one parameterized WHERE clause and reuse it in both CTEs. Keeping
+        # the filter and parameter numbering shared prevents the total count from
+        # drifting away from the rows returned for the current page.
+        where_conditions = ["workspace=$1"]
         if status_filter_values is not None:
             param_count += 1
-            where_clause = "WHERE workspace=$1 AND status = ANY($2)"
             params["status_filters"] = sorted(status_filter_values)
-        else:
-            where_clause = "WHERE workspace=$1"
+            where_conditions.append(f"status = ANY(${param_count})")
+        if file_name is not None:
+            param_count += 1
+            params["file_name"] = file_name
+            where_conditions.append(
+                "strpos(lower(COALESCE(file_path, '')), "
+                f"lower(${param_count})) > 0"
+            )
+        where_clause = "WHERE " + " AND ".join(where_conditions)
 
         # Build ORDER BY clause using validated whitelist values.
         # NULLS LAST is applied in both the inner paged CTE and the outer query so

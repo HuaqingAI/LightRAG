@@ -2,6 +2,7 @@ import { afterEach, beforeAll, describe, expect, test } from 'bun:test'
 
 type DocumentsRequest = {
   status_filter?: 'pending' | 'processing' | 'preprocessed' | 'processed' | 'failed' | null
+  file_name?: string | null
   page: number
   page_size: number
   sort_field: 'created_at' | 'updated_at' | 'id' | 'file_path'
@@ -47,6 +48,42 @@ afterEach(() => {
 })
 
 describe('getDocumentsPaginated', () => {
+  test('keeps filename filters distinct in the in-flight request key', async () => {
+    const filenames: Array<string | null | undefined> = []
+    const response = {
+      documents: [],
+      pagination: {
+        page: 1,
+        page_size: 20,
+        total_count: 0,
+        total_pages: 0,
+        has_next: false,
+        has_prev: false
+      },
+      status_counts: { all: 0 }
+    }
+
+    apiModule.__setPaginatedDocumentsPostForTests((request) => {
+      filenames.push(request.file_name)
+      return Promise.resolve(response)
+    })
+
+    const baseRequest: DocumentsRequest = {
+      status_filter: null,
+      page: 1,
+      page_size: 20,
+      sort_field: 'updated_at',
+      sort_direction: 'desc'
+    }
+
+    await Promise.all([
+      apiModule.getDocumentsPaginated({ ...baseRequest, file_name: 'alpha' }),
+      apiModule.getDocumentsPaginated({ ...baseRequest, file_name: 'beta' })
+    ])
+
+    expect(filenames).toEqual(['alpha', 'beta'])
+  })
+
   test('issues a fresh request after aborting a timed-out in-flight request', async () => {
     const request: DocumentsRequest = {
       status_filter: null,

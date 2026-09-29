@@ -148,6 +148,21 @@ def _page_row(doc_id="doc-1", created_at=_TS, **overrides):
     return row
 
 
+def _paginated_doc_row(doc_id="doc-1", created_at=_TS, **overrides):
+    row = _page_row(doc_id=doc_id, created_at=created_at)
+    row.update(
+        {
+            "content_summary": "summary",
+            "content_length": 7,
+            "chunks_count": 1,
+            "error_msg": None,
+            "content_hash": None,
+        }
+    )
+    row.update(overrides)
+    return row
+
+
 # ---------------------------------------------------------------------------
 # Cursor encode/decode
 # ---------------------------------------------------------------------------
@@ -311,6 +326,34 @@ async def test_page_sql_with_cursor():
     assert params[2] == "doc-1"
     assert params[3] == 10  # the shared limit
     assert params[4:] == ["pending", "failed"]
+
+
+async def test_paginated_sql_reuses_parameterized_file_name_filter_for_count_and_page():
+    row = _paginated_doc_row(
+        doc_id="report-1",
+        file_path="Annual Report.PDF",
+        status="processed",
+        _total_count=1,
+    )
+    db = _FakeDB(results=[[row]])
+    storage = _storage(db)
+
+    documents, total_count = await storage.get_docs_paginated(
+        status_filters=[DocStatus.PROCESSED, DocStatus.FAILED],
+        file_name="  report ",
+        page=2,
+        page_size=10,
+    )
+
+    assert total_count == 1
+    assert [doc_id for doc_id, _ in documents] == ["report-1"]
+    sql, params, multirows = db.calls[0]
+    assert multirows is True
+    predicate = "strpos(lower(COALESCE(file_path, '')), lower($3)) > 0"
+    assert sql.count(predicate) == 2
+    assert "report" not in sql
+    assert "LIMIT $4 OFFSET $5" in sql
+    assert params == ["ws", ["failed", "processed"], "report", 10, 10]
 
 
 async def test_page_full_returns_cursor_after_last_returned_row():

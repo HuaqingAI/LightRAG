@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
+import { useState, useEffect, useCallback, useMemo, useRef, type FormEvent } from 'react'
 import { useTranslation } from 'react-i18next'
 import { useSettingsStore } from '@/stores/settings'
 import Button from '@/components/ui/Button'
@@ -12,6 +12,7 @@ import {
   TableRow
 } from '@/components/ui/Table'
 import { Card, CardHeader, CardTitle, CardContent, CardDescription } from '@/components/ui/Card'
+import Input from '@/components/ui/Input'
 import EmptyCard from '@/components/ui/EmptyCard'
 import Checkbox from '@/components/ui/Checkbox'
 import UploadDocumentsDialog from '@/components/documents/UploadDocumentsDialog'
@@ -42,7 +43,7 @@ import { toast } from 'sonner'
 import { useBackendState } from '@/stores/state'
 import { copyToClipboard } from '@/utils/clipboard'
 
-import { RefreshCwIcon, ActivityIcon, ArrowUpIcon, ArrowDownIcon, RotateCcwIcon, CheckSquareIcon, XIcon, AlertTriangle, Info, CopyIcon } from 'lucide-react'
+import { RefreshCwIcon, ActivityIcon, ArrowUpIcon, ArrowDownIcon, RotateCcwIcon, CheckSquareIcon, XIcon, AlertTriangle, Info, CopyIcon, SearchIcon } from 'lucide-react'
 import PipelineStatusDialog from '@/components/documents/PipelineStatusDialog'
 import {
   getStatusRequestFilters,
@@ -345,6 +346,7 @@ type SortField = 'created_at' | 'updated_at' | 'id' | 'file_path';
 type SortDirection = 'asc' | 'desc';
 type QuerySnapshot = {
   statusFilter: StatusFilter
+  fileNameFilter: string
   page: number
   pageSize: number
   sortField: SortField
@@ -436,6 +438,11 @@ export default function DocumentManager() {
 
   // State for document status filter
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('all');
+  // Keep the text being edited separate from the committed query so typing does
+  // not issue one paginated request per character. The committed value is part
+  // of QuerySnapshot and therefore follows the existing refresh queue.
+  const [fileNameInput, setFileNameInput] = useState('')
+  const [fileNameFilter, setFileNameFilter] = useState('')
 
   // State to store page number for each status filter
   const [pageByStatus, setPageByStatus] = useState<Record<StatusFilter, number>>({
@@ -654,17 +661,19 @@ export default function DocumentManager() {
     overrides: Partial<QuerySnapshot> = {}
   ): QuerySnapshot => ({
     statusFilter: overrides.statusFilter ?? statusFilter,
+    fileNameFilter: overrides.fileNameFilter ?? fileNameFilter,
     page: overrides.page ?? pagination.page,
     pageSize: overrides.pageSize ?? pagination.page_size,
     sortField: overrides.sortField ?? sortField,
     sortDirection: overrides.sortDirection ?? sortDirection
-  }), [pagination.page, pagination.page_size, sortField, sortDirection, statusFilter])
+  }), [fileNameFilter, pagination.page, pagination.page_size, sortField, sortDirection, statusFilter])
 
   const buildDocumentsRequest = useCallback((
     query: QuerySnapshot,
     page: number = query.page
   ): DocumentsRequest => ({
     ...getStatusRequestFilters(query.statusFilter),
+    file_name: query.fileNameFilter || null,
     page,
     page_size: query.pageSize,
     sort_field: query.sortField,
@@ -1180,7 +1189,7 @@ export default function DocumentManager() {
 
   useEffect(() => {
     latestRefreshRequestVersionRef.current += 1
-  }, [pagination.page, pagination.page_size, statusFilter, sortField, sortDirection])
+  }, [fileNameFilter, pagination.page, pagination.page_size, statusFilter, sortField, sortDirection])
 
   // Monitor pipelineActive changes and trigger an immediate refresh. The
   // polling interval is reconciled by the main polling useEffect below
@@ -1289,6 +1298,46 @@ export default function DocumentManager() {
     setPagination(prev => ({ ...prev, page: newPage }));
   }, [statusFilter, pagination.page, pageByStatus]);
 
+  // Commit a filename filter only when the user submits the search form. This
+  // keeps the input responsive and lets the existing query/version guards handle
+  // the resulting page reset and refresh.
+  const handleFileNameSearchSubmit = useCallback((event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    const nextFilter = fileNameInput.trim()
+    setFileNameInput(nextFilter)
+
+    if (nextFilter === fileNameFilter) return
+
+    setFileNameFilter(nextFilter)
+    setPageByStatus({
+      all: 1,
+      completed: 1,
+      parse: 1,
+      analyze: 1,
+      process: 1,
+      failed: 1,
+    })
+    setPagination(prev => ({ ...prev, page: 1 }))
+    setSelectedDocIds([])
+  }, [fileNameFilter, fileNameInput])
+
+  const handleClearFileNameSearch = useCallback(() => {
+    setFileNameInput('')
+    if (fileNameFilter === '') return
+
+    setFileNameFilter('')
+    setPageByStatus({
+      all: 1,
+      completed: 1,
+      parse: 1,
+      analyze: 1,
+      process: 1,
+      failed: 1,
+    })
+    setPagination(prev => ({ ...prev, page: 1 }))
+    setSelectedDocIds([])
+  }, [fileNameFilter])
+
   // Handle documents deleted callback
   const handleDocumentsDeleted = useCallback(async () => {
     setSelectedDocIds([])
@@ -1355,18 +1404,21 @@ export default function DocumentManager() {
   const [previousSelectionDeps, setPreviousSelectionDeps] = useState({
     page: pagination.page,
     statusFilter,
+    fileNameFilter,
     sortField,
     sortDirection
   })
   if (
     previousSelectionDeps.page !== pagination.page ||
     previousSelectionDeps.statusFilter !== statusFilter ||
+    previousSelectionDeps.fileNameFilter !== fileNameFilter ||
     previousSelectionDeps.sortField !== sortField ||
     previousSelectionDeps.sortDirection !== sortDirection
   ) {
     setPreviousSelectionDeps({
       page: pagination.page,
       statusFilter,
+      fileNameFilter,
       sortField,
       sortDirection
     })
@@ -1387,7 +1439,8 @@ export default function DocumentManager() {
     sortField,
     sortDirection,
     pageRestoreGeneration,
-    fetchPaginatedDocuments
+    fetchPaginatedDocuments,
+    fileNameFilter
   ]);
 
   return (
@@ -1475,10 +1528,10 @@ export default function DocumentManager() {
 
         <Card className="flex-1 flex flex-col border rounded-md min-h-0 mb-2">
           <CardHeader className="flex-none py-2 px-4">
-            <div className="flex justify-between items-center">
+            <div className="flex flex-wrap justify-between items-center gap-2">
               <CardTitle>{t('documentPanel.documentManager.uploadedTitle')}</CardTitle>
-              <div className="flex items-center gap-2">
-                <div className="flex gap-1" dir={i18n.dir()}>
+              <div className="flex flex-wrap items-center gap-2">
+                <div className="flex flex-wrap gap-1" dir={i18n.dir()}>
                   <Button
                     size="sm"
                     variant={statusFilter === 'all' ? 'secondary' : 'outline'}
@@ -1562,7 +1615,61 @@ export default function DocumentManager() {
                   <RotateCcwIcon className="h-4 w-4" />
                 </Button>
               </div>
-              <div className="flex items-center gap-2">
+              <div className="flex flex-wrap items-center gap-2">
+                <form
+                  onSubmit={handleFileNameSearchSubmit}
+                  className="flex items-center gap-1"
+                >
+                  <Input
+                    id="file-name-search"
+                    type="search"
+                    value={fileNameInput}
+                    onChange={(event) => setFileNameInput(event.target.value)}
+                    placeholder={t(
+                      'documentPanel.documentManager.fileNameSearchPlaceholder',
+                      { defaultValue: 'Filter by file name' }
+                    )}
+                    aria-label={t(
+                      'documentPanel.documentManager.fileNameSearchLabel',
+                      { defaultValue: 'Filter by file name' }
+                    )}
+                    className="h-8 w-44"
+                  />
+                  <Button
+                    type="submit"
+                    variant="outline"
+                    size="icon"
+                    disabled={!fileNameInput.trim() || fileNameInput.trim() === fileNameFilter}
+                    tooltip={t(
+                      'documentPanel.documentManager.fileNameSearchTooltip',
+                      { defaultValue: 'Filter by file name' }
+                    )}
+                    aria-label={t(
+                      'documentPanel.documentManager.fileNameSearchTooltip',
+                      { defaultValue: 'Filter by file name' }
+                    )}
+                  >
+                    <SearchIcon />
+                  </Button>
+                  {(fileNameInput !== '' || fileNameFilter !== '') && (
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon"
+                      onClick={handleClearFileNameSearch}
+                      tooltip={t(
+                        'documentPanel.documentManager.clearFileNameSearchTooltip',
+                        { defaultValue: 'Clear file name filter' }
+                      )}
+                      aria-label={t(
+                        'documentPanel.documentManager.clearFileNameSearchTooltip',
+                        { defaultValue: 'Clear file name filter' }
+                      )}
+                    >
+                      <XIcon />
+                    </Button>
+                  )}
+                </form>
                 <label
                   htmlFor="toggle-filename-btn"
                   className="text-sm text-gray-500"
