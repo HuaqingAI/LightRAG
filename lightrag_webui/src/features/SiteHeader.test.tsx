@@ -98,4 +98,13 @@ describe('admin header deployment identity', () => {
     const link = screen.getByRole('link', { name: /LightRAG/ })
     expect(link.getAttribute('href')).toBe('./')
   })
+
+  test('hides the knowledge graph tab in the admin WebUI', () => {
+    setDeployment(null, null)
+    renderHeader()
+
+    expect(screen.getByRole('tab', { name: 'Documents' })).toBeInTheDocument()
+    expect(screen.getByRole('tab', { name: 'Retrieval' })).toBeInTheDocument()
+    expect(screen.queryAllByRole('tab', { name: 'Knowledge Graph' })).toHaveLength(0)
+  })
 })

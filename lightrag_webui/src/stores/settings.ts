@@ -12,7 +12,10 @@ import { createFutureGuardedStorage } from '@/lib/guardedStorage'
 
 type Theme = 'dark' | 'light' | 'system'
 type Language = 'en' | 'zh' | 'fr' | 'ar' | 'zh_TW' | 'ru' | 'ja' | 'de' | 'uk' | 'ko' | 'vi'
-type Tab = 'documents' | 'knowledge-graph' | 'retrieval'
+type Tab = 'documents' | 'retrieval'
+
+const normalizeCurrentTab = (tab: unknown): Tab =>
+  tab === 'retrieval' ? 'retrieval' : 'documents'
 
 // NOTE: `querySettings` and `retrievalHistory` were split out of this store
 // into their own persist keys — see stores/querySettings.ts,
@@ -177,7 +180,7 @@ const useSettingsStoreBase = create<SettingsState>()(
 
       setApiKey: (apiKey: string | null) => set({ apiKey }),
 
-      setCurrentTab: (tab: Tab) => set({ currentTab: tab }),
+      setCurrentTab: (tab: Tab) => set({ currentTab: normalizeCurrentTab(tab) }),
 
       setShowFileName: (show: boolean) => set({ showFileName: show }),
       setShowLegend: (show: boolean) => set({ showLegend: show }),
@@ -266,7 +269,19 @@ const useSettingsStoreBase = create<SettingsState>()(
               typeof state.language === 'string' && state.language !== 'en'
           }
         }
+        state.currentTab = normalizeCurrentTab(state.currentTab)
         return state
+      },
+      merge: (persistedState: unknown, currentState) => {
+        if (!persistedState || typeof persistedState !== 'object') {
+          return currentState
+        }
+        const persisted = persistedState as Partial<SettingsState>
+        return {
+          ...currentState,
+          ...persisted,
+          currentTab: normalizeCurrentTab(persisted.currentTab)
+        }
       }
     }
   )
