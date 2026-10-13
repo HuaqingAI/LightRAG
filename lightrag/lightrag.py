@@ -160,6 +160,7 @@ from lightrag.utils_pipeline import (
     make_custom_chunk_operation_id,
     make_kg_purge_operation_id,
     normalize_document_file_path,
+    read_source_file_basename,
     require_doc_status_record,
 )
 from lightrag.constants import GRAPH_FIELD_SEP, RELATION_NO_EVIDENCE_SOURCE_IDS
@@ -5781,6 +5782,7 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
         deletion_stage = "initializing"
         doc_status_data: dict[str, Any] | None = None
         file_path: str | None = None
+        source_file: str | None = None
 
         # Acquire (or join a batch delete) INSIDE the same handoff-aware
         # try/finally as the deletion itself: any escape after the slot is
@@ -5909,6 +5911,7 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
             metadata = doc_status_data.get("metadata", {})
             if not isinstance(metadata, dict):
                 metadata = {}
+            source_file = read_source_file_basename(metadata)
             metadata_cache_ids = normalize_string_list(
                 metadata.get("deletion_llm_cache_ids", []),
                 context=f"doc {doc_id} metadata.deletion_llm_cache_ids",
@@ -6045,6 +6048,7 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
                     message=log_message,
                     status_code=200,
                     file_path=file_path,
+                    source_file=source_file,
                 )
 
             # Mark that deletion operations have started
@@ -6233,6 +6237,7 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
                 message=log_message,
                 status_code=200,
                 file_path=file_path,
+                source_file=source_file,
             )
 
         except (RecoveryAnchorMissingError, KGPurgeOperationConflictError) as e:
@@ -6267,6 +6272,7 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
                 message=error_message,
                 status_code=409,
                 file_path=file_path,
+                source_file=source_file,
             )
 
         except Exception as e:
@@ -6305,6 +6311,7 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
                 message=error_message,
                 status_code=500,
                 file_path=file_path,
+                source_file=source_file,
             )
 
         finally:
@@ -6412,6 +6419,7 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
                                 message=f"Deletion completed but failed to persist changes: {persistence_error}",
                                 status_code=500,
                                 file_path=file_path,
+                                source_file=source_file,
                             )
                         # If there was an original exception, log the persistence error but
                         # don't override it — the original error result was already returned.

@@ -78,8 +78,14 @@ from lightrag.exceptions import (
 )
 from lightrag.constants import (
     DEFAULT_SCAN_ENQUEUE_BATCH_SIZE,
+    DUPLICATE_DISMISSED_AT_METADATA_KEY,
+    DUPLICATE_DISMISSED_METADATA_KEY,
+    DUPLICATE_DISMISSED_REASON_METADATA_KEY,
+    DUPLICATE_DISMISSED_REASON_USER_CLEAR,
+    DUPLICATE_RETRYABLE_METADATA_KEY,
     FILE_EXTRACTION_SUMMARY_PREFIX,
     FULL_DOCS_FORMAT_PENDING_PARSE,
+    INTERNAL_UPLOAD_STAGING_PREFIX,
     MAX_R_SEPARATOR_CHARS,
     MAX_R_SEPARATORS,
     PARSED_ARTIFACT_DIR_SUFFIXES,
@@ -119,7 +125,11 @@ from lightrag.utils import (
     validate_file_path_security,
 )
 from lightrag.kg.shared_storage import append_pipeline_history
-from lightrag.utils_pipeline import count_active_documents, read_source_file_basename
+from lightrag.utils_pipeline import (
+    count_active_documents,
+    doc_status_field,
+    read_source_file_basename,
+)
 from lightrag.api.admission import adopt_admission_ticket
 from lightrag.api.utils_api import get_combined_auth_dependency
 from ..config import global_args
@@ -180,6 +190,15 @@ _ADMISSION_RETRY_AFTER_SECONDS = 30
 _UNSAFE_DOCUMENT_SOURCE_CHAR_PATTERN = re.compile(
     "[\u0000-\u001f\u007f\ud800-\udfff\ufffe\uffff]"
 )
+
+
+def make_internal_upload_staging_filename(safe_filename: str) -> str:
+    """Return a server-generated physical upload basename for ``safe_filename``."""
+    return f"{INTERNAL_UPLOAD_STAGING_PREFIX}{uuid4().hex}__{Path(safe_filename).name}"
+
+
+def is_internal_upload_staging_file(filename: str) -> bool:
+    return Path(filename).name.startswith(INTERNAL_UPLOAD_STAGING_PREFIX)
 
 
 def find_unsafe_document_source_character(value: str) -> str | None:
@@ -1152,6 +1171,72 @@ class DocStatusResponse(BaseModel):
     )
 
 
+def make_doc_status_response(doc_id: str, doc_status: Any) -> DocStatusResponse:
+    return DocStatusResponse(
+        id=doc_id,
+        content_summary=doc_status_field(doc_status, "content_summary", ""),
+        content_length=int(doc_status_field(doc_status, "content_length", 0) or 0),
+        status=doc_status_field(doc_status, "status", DocStatus.FAILED),
+        created_at=format_datetime(doc_status_field(doc_status, "created_at", "")),
+        updated_at=format_datetime(doc_status_field(doc_status, "updated_at", "")),
+        track_id=doc_status_field(doc_status, "track_id", None),
+        chunks_count=doc_status_field(doc_status, "chunks_count", None),
+        error_msg=doc_status_field(doc_status, "error_msg", None),
+        metadata=doc_status_field(doc_status, "metadata", None),
+        file_path=normalize_file_path(doc_status_field(doc_status, "file_path", "")),
+    )
+
+
+def is_retryable_filename_duplicate_doc(doc_status: Any) -> bool:
+    metadata = doc_status_field(doc_status, "metadata", {})
+    if not isinstance(metadata, dict):
+        return False
+    return (
+        doc_status_field(doc_status, "status", None) == DocStatus.FAILED
+        or doc_status_field(doc_status, "status", None) == DocStatus.FAILED.value
+    ) and (
+        metadata.get(DUPLICATE_RETRYABLE_METADATA_KEY) is True
+        and metadata.get("is_duplicate") is True
+        and metadata.get("duplicate_kind") == "filename"
+        and metadata.get(DUPLICATE_DISMISSED_METADATA_KEY) is not True
+        and bool(metadata.get("original_doc_id"))
+    )
+
+
+class DuplicateDocumentGroup(BaseModel):
+    original: DocStatusResponse
+    duplicate_count: int
+    duplicate_doc_ids: List[str] = Field(default_factory=list)
+    duplicates: List[DocStatusResponse] = Field(default_factory=list)
+
+
+class DuplicateDocumentsResponse(BaseModel):
+    groups: List[DuplicateDocumentGroup] = Field(default_factory=list)
+    total_groups: int = 0
+    total_duplicates: int = 0
+
+
+class DismissDuplicateDocumentsRequest(BaseModel):
+    original_doc_ids: List[str] = Field(
+        ..., description="Original document IDs whose retryable duplicates should be dismissed."
+    )
+
+    @field_validator("original_doc_ids", mode="after")
+    @classmethod
+    def validate_original_doc_ids(cls, doc_ids: List[str]) -> List[str]:
+        cleaned = [doc_id.strip() for doc_id in doc_ids if doc_id and doc_id.strip()]
+        if not cleaned:
+            raise ValueError("original_doc_ids cannot be empty")
+        return sorted(set(cleaned))
+
+
+class DismissDuplicateDocumentsResponse(BaseModel):
+    status: Literal["success"] = "success"
+    cleared: int = 0
+    already_cleared: int = 0
+    not_found: int = 0
+
+
 class TrackStatusResponse(BaseModel):
     """Response model for tracking document processing status by track_id
 
@@ -1554,6 +1639,8 @@ class DocumentManager:
                 file_path = Path(entry.path)
                 # Suffix comparison is case-sensitive, matching the per-suffix glob
                 # this replaced; ``__parsed__`` and any other directory is skipped.
+                if is_internal_upload_staging_file(file_path.name):
+                    continue
                 if file_path.suffix not in suffixes or not file_path.is_file():
                     continue
                 if file_path in self.indexed_files:
@@ -2254,6 +2341,36 @@ def delete_file_variants_by_file_path(
     return deleted_files, errors
 
 
+def delete_exact_internal_source_file(
+    input_dir: Path,
+    source_file: str | None,
+) -> tuple[list[str], list[str]]:
+    """Delete one internally staged physical upload file by exact basename."""
+    source_name = Path(str(source_file or "").strip()).name
+    if not source_name or not is_internal_upload_staging_file(source_name):
+        return [], []
+
+    safe_candidate = validate_file_path_security(source_name, input_dir)
+    if safe_candidate is None:
+        return [], [f"Unsafe staged source file skipped: {source_name}"]
+
+    try:
+        input_dir_resolved = input_dir.resolve()
+    except Exception as e:
+        return [], [f"Failed to resolve input directory {input_dir}: {e}"]
+
+    if not safe_candidate.exists():
+        return [], []
+    if not safe_candidate.is_file():
+        return [], [f"Staged source path is not a file: {source_name}"]
+
+    try:
+        safe_candidate.unlink()
+        return [str(safe_candidate.relative_to(input_dir_resolved))], []
+    except Exception as e:
+        return [], [f"Failed to delete staged source file {source_name}: {e}"]
+
+
 async def record_scan_warning(rag: LightRAG, message: str) -> None:
     logger.warning(message)
     try:
@@ -2303,9 +2420,12 @@ async def pipeline_enqueue_file(
     rag: LightRAG,
     file_path: Path,
     track_id: str = None,
+    *,
+    logical_file_path: str | Path | None = None,
     from_scan: bool = False,
     admission_token: str | None = None,
     known_file_size: int | None = None,
+    retryable_duplicate_source: str | None = None,
 ) -> tuple[bool, str]:
     """Add a file to the queue for processing
 
@@ -2332,6 +2452,8 @@ async def pipeline_enqueue_file(
     # Generate track_id if not provided
     if track_id is None:
         track_id = generate_track_id("unknown")
+    logical_name = Path(str(logical_file_path or file_path.name)).name
+    stored_file_path = logical_name if logical_file_path is not None else str(file_path)
 
     # Single chokepoint for every file-shaped ingest: refuse a basename that
     # cannot survive as a document source before anything is written. Reachable
@@ -2341,11 +2463,11 @@ async def pipeline_enqueue_file(
     # ``doc_status.file_path``, which is the outcome this guard exists to
     # prevent, and every error-document construction below (including the
     # catch-all) interpolates ``file_path.name`` raw.
-    unsafe_char = find_unsafe_document_source_character(file_path.name)
+    unsafe_char = find_unsafe_document_source_character(logical_name)
     if unsafe_char is not None:
         logger.error(
             "[File Extraction]Refusing file with an unsafe document source: "
-            f"{describe_rejected_document_source(file_path.name)} contains "
+            f"{describe_rejected_document_source(logical_name)} contains "
             f"U+{ord(unsafe_char):04X}"
         )
         return False, track_id
@@ -2364,11 +2486,11 @@ async def pipeline_enqueue_file(
                 file_size = 0
 
         try:
-            directives = resolve_parser_directives(file_path)
+            directives = resolve_parser_directives(logical_name)
         except FilenameParserHintError as e:
             error_files = [
                 {
-                    "file_path": str(file_path.name),
+                    "file_path": logical_name,
                     "error_description": FILE_EXTRACTION_SUMMARY_PREFIX
                     + "Filename hint error",
                     "original_error": str(e),
@@ -2377,7 +2499,7 @@ async def pipeline_enqueue_file(
             ]
             await rag.apipeline_enqueue_error_documents(error_files, track_id)
             logger.error(
-                f"[File Extraction]Invalid filename hint in {file_path.name}: {e}"
+                f"[File Extraction]Invalid filename hint in {logical_name}: {e}"
             )
             return False, track_id
 
@@ -2405,7 +2527,7 @@ async def pipeline_enqueue_file(
             except ValueError as e:
                 error_files = [
                     {
-                        "file_path": str(file_path.name),
+                        "file_path": logical_name,
                         "error_description": FILE_EXTRACTION_SUMMARY_PREFIX
                         + "Chunk parameter error",
                         "original_error": str(e),
@@ -2415,7 +2537,7 @@ async def pipeline_enqueue_file(
                 await rag.apipeline_enqueue_error_documents(error_files, track_id)
                 logger.error(
                     f"[File Extraction]Invalid chunk parameters in "
-                    f"{file_path.name}: {e}"
+                    f"{logical_name}: {e}"
                 )
                 return False, track_id
         # All engines defer parsing to the worker stage: the file is already
@@ -2430,19 +2552,25 @@ async def pipeline_enqueue_file(
         )
         try:
             enqueue_kwargs = {
-                "file_paths": str(file_path),
+                "file_paths": stored_file_path,
                 "track_id": track_id,
                 "docs_format": FULL_DOCS_FORMAT_PENDING_PARSE,
                 "parse_engine": parse_engine_field,
                 "process_options": api_process_options,
                 "from_scan": from_scan,
             }
+            if file_path.name != Path(stored_file_path).name or retryable_duplicate_source is not None:
+                enqueue_kwargs["source_files"] = file_path.name
             if admission_token is not None:
                 # Only sent when the caller actually holds a reservation; None
                 # is the enqueue's own default and adding it would be noise.
                 enqueue_kwargs["admission_token"] = admission_token
             if hint_chunk_options is not None:
                 enqueue_kwargs["chunk_options"] = hint_chunk_options
+            if retryable_duplicate_source is not None:
+                enqueue_kwargs["retryable_duplicate_source"] = (
+                    retryable_duplicate_source
+                )
             enqueue_result = await rag.apipeline_enqueue_documents("", **enqueue_kwargs)
             if enqueue_result is None:
                 try:
@@ -2453,13 +2581,13 @@ async def pipeline_enqueue_file(
                     )
                 return False, track_id
             logger.info(
-                f"[File Extraction]Deferred {file_path.name} to {extraction_engine} parser"
+                f"[File Extraction]Deferred {logical_name} to {extraction_engine} parser"
             )
             return True, track_id
         except Exception as e:
             error_files = [
                 {
-                    "file_path": str(file_path.name),
+                    "file_path": logical_name,
                     "error_description": FILE_EXTRACTION_SUMMARY_PREFIX
                     + "Parser enqueue error",
                     "original_error": f"Failed to enqueue file for parser: {str(e)}",
@@ -2468,7 +2596,7 @@ async def pipeline_enqueue_file(
             ]
             await rag.apipeline_enqueue_error_documents(error_files, track_id)
             logger.error(
-                f"[File Extraction]Error enqueuing {file_path.name} for {extraction_engine}: {str(e)}"
+                f"[File Extraction]Error enqueuing {logical_name} for {extraction_engine}: {str(e)}"
             )
             return False, track_id
 
@@ -2481,14 +2609,14 @@ async def pipeline_enqueue_file(
 
         error_files = [
             {
-                "file_path": str(file_path.name),
+                "file_path": logical_name,
                 "error_description": "Unexpected processing error",
                 "original_error": f"Unexpected error: {str(e)}",
                 "file_size": file_size,
             }
         ]
         await rag.apipeline_enqueue_error_documents(error_files, track_id)
-        logger.error(f"Enqueuing file {file_path.name} error: {str(e)}")
+        logger.error(f"Enqueuing file {logical_name} error: {str(e)}")
         logger.error(traceback.format_exc())
         return False, track_id
     finally:
@@ -2503,7 +2631,10 @@ async def pipeline_index_file(
     rag: LightRAG,
     file_path: Path,
     track_id: str = None,
+    *,
+    logical_file_path: str | Path | None = None,
     admission_token: str | None = None,
+    retryable_duplicate_source: str | None = None,
 ):
     """Index a file with track_id
 
@@ -2517,7 +2648,12 @@ async def pipeline_index_file(
     """
     try:
         success, _ = await pipeline_enqueue_file(
-            rag, file_path, track_id, admission_token=admission_token
+            rag,
+            file_path,
+            logical_file_path=logical_file_path,
+            track_id=track_id,
+            admission_token=admission_token,
+            retryable_duplicate_source=retryable_duplicate_source,
         )
         if success:
             await rag.apipeline_process_enqueue_documents()
@@ -4314,6 +4450,32 @@ async def background_delete_documents(
                         async with pipeline_status_lock:
                             pipeline_status["latest_message"] = no_file_msg
                             append_pipeline_history(pipeline_status, no_file_msg)
+
+                    if delete_file and getattr(result, "source_file", None):
+                        deleted_files, file_delete_errors = (
+                            delete_exact_internal_source_file(
+                                doc_manager.input_dir,
+                                getattr(result, "source_file", None),
+                            )
+                        )
+                        for file_delete_error in file_delete_errors:
+                            logger.warning(file_delete_error)
+                            async with pipeline_status_lock:
+                                pipeline_status["latest_message"] = file_delete_error
+                                append_pipeline_history(
+                                    pipeline_status, file_delete_error
+                                )
+                        if deleted_files:
+                            staged_delete_msg = (
+                                "Successfully deleted staged source files: "
+                                + ", ".join(deleted_files)
+                            )
+                            logger.info(staged_delete_msg)
+                            async with pipeline_status_lock:
+                                pipeline_status["latest_message"] = staged_delete_msg
+                                append_pipeline_history(
+                                    pipeline_status, staged_delete_msg
+                                )
                 else:
                     failed_deletions.append(doc_id)
                     error_msg = f"Failed to delete {i}/{total_docs}: {doc_id}[{file_path}] - {result.message}"
@@ -5222,7 +5384,7 @@ def create_document_routes(
 
         Raises:
             HTTPException: 400 unsupported file type or malformed filename
-                hint, 409 same-name conflict or scan-classifying /
+                hint, 409 unsafe upload path or scan-classifying /
                 destructive job in flight, 413 file too large, 422 invalid
                 chunking configuration (an explicit ``C`` selector without a
                 custom ``LightRAG.chunking_func``), 500 other errors.
@@ -5301,44 +5463,8 @@ def create_document_routes(
                         f"File size not available in UploadFile for {safe_filename}, will check during streaming"
                     )
 
-            file_path = doc_manager.input_dir / safe_filename
-
-            # Strict name pre-check.  Both the INPUT directory and doc_status
-            # must be free of any same-canonical-basename record before we
-            # accept the upload.  Replacing an existing document requires an
-            # explicit DELETE first; we no longer write a "duplicated" 200
-            # response that silently no-ops.
-            existing_doc_data = await get_existing_doc_by_file_path_candidates(
-                rag.doc_status, file_path
-            )
-            if existing_doc_data:
-                status = get_doc_status_value(existing_doc_data) or "unknown"
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        f"Document storage already contains '{safe_filename}' "
-                        f"(Status: {status}). Delete the existing record before re-uploading."
-                    ),
-                )
-
-            # INPUT directory check, using canonical parser-hint names.
-            # Fast path: exact filename match avoids iterdir on large input directories.
-            canonical_filename = normalize_file_path(safe_filename)
-            if file_path.exists():
-                existing_input_file: Path | None = file_path
-            else:
-                existing_input_file = find_existing_file_by_file_path(
-                    doc_manager.input_dir, canonical_filename
-                )
-            if existing_input_file:
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        f"Input directory already contains a file with the same "
-                        f"canonical basename ('{existing_input_file.name}'). "
-                        f"Remove or rename it before re-uploading."
-                    ),
-                )
+            staging_filename = make_internal_upload_staging_filename(safe_filename)
+            file_path = doc_manager.input_dir / staging_filename
 
             # Async streaming write with size check
             bytes_written = 0
@@ -5435,8 +5561,10 @@ def create_document_routes(
                     await pipeline_index_file(
                         rag,
                         file_path,
-                        track_id,
+                        logical_file_path=safe_filename,
+                        track_id=track_id,
                         admission_token=enqueue_token,
+                        retryable_duplicate_source="webui_upload",
                     )
                 finally:
                     await _release_enqueue_slot(rag, enqueue_token)
@@ -6331,6 +6459,146 @@ def create_document_routes(
             # acquired (or the start helper's backstop already released it).
             if not handed_off:
                 await _release_destructive_busy(rag, destructive_token)
+
+    @router.get(
+        "/duplicates",
+        response_model=DuplicateDocumentsResponse,
+        dependencies=[Depends(combined_auth)],
+    )
+    async def list_duplicate_documents() -> DuplicateDocumentsResponse:
+        """List retryable same-name duplicate groups keyed by their old primary."""
+        try:
+            failed_docs = await rag.doc_status.get_docs_by_statuses(
+                [DocStatus.FAILED], strict=True
+            )
+            grouped: dict[str, list[tuple[str, Any]]] = {}
+            for doc_id, doc_status in failed_docs.items():
+                if not is_retryable_filename_duplicate_doc(doc_status):
+                    continue
+                metadata = doc_status_field(doc_status, "metadata", {})
+                original_doc_id = str(metadata.get("original_doc_id") or "")
+                if original_doc_id:
+                    grouped.setdefault(original_doc_id, []).append((doc_id, doc_status))
+
+            groups: list[DuplicateDocumentGroup] = []
+            strict_reads = getattr(rag.doc_status, "supports_strict_point_reads", False)
+            for original_doc_id, duplicates in grouped.items():
+                original_doc = await (
+                    rag.doc_status.get_by_id_strict(original_doc_id)
+                    if strict_reads
+                    else rag.doc_status.get_by_id(original_doc_id)
+                )
+                if not original_doc:
+                    continue
+                groups.append(
+                    DuplicateDocumentGroup(
+                        original=make_doc_status_response(original_doc_id, original_doc),
+                        duplicate_count=len(duplicates),
+                        duplicate_doc_ids=[doc_id for doc_id, _ in duplicates],
+                        duplicates=[
+                            make_doc_status_response(doc_id, duplicate)
+                            for doc_id, duplicate in duplicates
+                        ],
+                    )
+                )
+
+            groups.sort(key=lambda group: group.original.file_path)
+            return DuplicateDocumentsResponse(
+                groups=groups,
+                total_groups=len(groups),
+                total_duplicates=sum(group.duplicate_count for group in groups),
+            )
+        except Exception as e:
+            logger.error(f"Error listing duplicate documents: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise internal_server_error(e)
+
+    @router.post(
+        "/duplicates/dismiss",
+        response_model=DismissDuplicateDocumentsResponse,
+        dependencies=[Depends(combined_auth)],
+    )
+    async def dismiss_duplicate_documents(
+        request: DismissDuplicateDocumentsRequest,
+    ) -> DismissDuplicateDocumentsResponse:
+        """Persistently hide retryable duplicate groups without deleting data."""
+        try:
+            from lightrag.kg.shared_storage import (
+                get_namespace_data,
+                get_namespace_lock,
+            )
+
+            pipeline_status = await get_namespace_data(
+                "pipeline_status", workspace=rag.workspace
+            )
+            pipeline_status_lock = get_namespace_lock(
+                "pipeline_status", workspace=rag.workspace
+            )
+            async with pipeline_status_lock:
+                if pipeline_status.get("scanning_exclusive"):
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "Cannot dismiss duplicate documents while a scan is "
+                            "classifying files; retry after it finishes."
+                        ),
+                    )
+
+            targets = set(request.original_doc_ids)
+            failed_docs = await rag.doc_status.get_docs_by_statuses(
+                [DocStatus.FAILED], strict=True
+            )
+            cleared = 0
+            already_cleared = 0
+            matched_originals: set[str] = set()
+            now = datetime.now(timezone.utc).isoformat()
+
+            for doc_id, doc_status in failed_docs.items():
+                metadata = doc_status_field(doc_status, "metadata", {})
+                if not isinstance(metadata, dict):
+                    continue
+                original_doc_id = str(metadata.get("original_doc_id") or "")
+                if original_doc_id not in targets:
+                    continue
+                if not (
+                    metadata.get(DUPLICATE_RETRYABLE_METADATA_KEY) is True
+                    and metadata.get("is_duplicate") is True
+                    and metadata.get("duplicate_kind") == "filename"
+                ):
+                    continue
+
+                matched_originals.add(original_doc_id)
+                if metadata.get(DUPLICATE_DISMISSED_METADATA_KEY) is True:
+                    already_cleared += 1
+                    continue
+
+                updated_metadata = dict(metadata)
+                updated_metadata[DUPLICATE_DISMISSED_METADATA_KEY] = True
+                updated_metadata[DUPLICATE_DISMISSED_AT_METADATA_KEY] = now
+                updated_metadata[DUPLICATE_DISMISSED_REASON_METADATA_KEY] = (
+                    DUPLICATE_DISMISSED_REASON_USER_CLEAR
+                )
+                await rag.doc_status.update_doc_status_fields(
+                    doc_id,
+                    {
+                        "metadata": updated_metadata,
+                        "updated_at": now,
+                    },
+                    missing_ok=True,
+                )
+                cleared += 1
+
+            return DismissDuplicateDocumentsResponse(
+                cleared=cleared,
+                already_cleared=already_cleared,
+                not_found=len(targets - matched_originals),
+            )
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Error dismissing duplicate documents: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise internal_server_error(e)
 
     @router.post(
         "/clear_cache",

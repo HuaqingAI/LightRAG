@@ -29,7 +29,11 @@ from lightrag.base import (
 from lightrag.constants import (
     CUSTOM_CHUNK_PATCH_METADATA_KEY,
     DOC_STATUS_CONTENT_SUMMARY_MAX_LENGTH,
+    DUPLICATE_DISMISSED_AT_METADATA_KEY,
+    DUPLICATE_DISMISSED_METADATA_KEY,
+    DUPLICATE_DISMISSED_REASON_METADATA_KEY,
     DUPLICATE_DEMOTION_METADATA_KEYS,
+    DUPLICATE_RETRYABLE_METADATA_KEY,
     FILE_EXTRACTION_SUMMARY_PREFIX,
     FULL_DOCS_FORMAT_LIGHTRAG,
     KG_PURGE_METADATA_KEY,
@@ -409,6 +413,11 @@ _DOC_STATUS_METADATA_CARRY_OVER_KEYS: tuple[str, ...] = (
     # and since a repair deliberately keeps the row's content and status, that
     # row is a normal document the pipeline will happily transition.
     *DUPLICATE_DEMOTION_METADATA_KEYS,
+    "original_track_id",
+    DUPLICATE_RETRYABLE_METADATA_KEY,
+    DUPLICATE_DISMISSED_METADATA_KEY,
+    DUPLICATE_DISMISSED_AT_METADATA_KEY,
+    DUPLICATE_DISMISSED_REASON_METADATA_KEY,
 )
 
 
@@ -615,6 +624,11 @@ _DOC_STATUS_METADATA_DIRECTIVE_KEYS: tuple[str, ...] = (
     # without these keys that reset handed the canonical source back to it,
     # putting the key straight back into conflict.
     *DUPLICATE_DEMOTION_METADATA_KEYS,
+    "original_track_id",
+    DUPLICATE_RETRYABLE_METADATA_KEY,
+    DUPLICATE_DISMISSED_METADATA_KEY,
+    DUPLICATE_DISMISSED_AT_METADATA_KEY,
+    DUPLICATE_DISMISSED_REASON_METADATA_KEY,
 )
 
 

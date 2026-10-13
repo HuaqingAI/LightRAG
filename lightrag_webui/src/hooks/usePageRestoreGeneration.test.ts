@@ -43,6 +43,7 @@ describe('BFCache consumers', () => {
     const documentManagerSource = await Bun.file(
       new URL('../features/DocumentManager.tsx', import.meta.url)
     ).text()
+    const normalizedDocumentManagerSource = documentManagerSource.replace(/\r\n/g, '\n')
 
     for (const source of [appSource, documentManagerSource]) {
       expect(source).toContain('const pageRestoreGeneration = usePageRestoreGeneration()')
@@ -53,7 +54,7 @@ describe('BFCache consumers', () => {
     expect(documentManagerSource).toContain(
       'pipelineActive, pageRestoreGeneration, startPollingInterval'
     )
-    expect(documentManagerSource).toContain('pageRestoreGeneration,\n    fetchPaginatedDocuments')
+    expect(normalizedDocumentManagerSource).toContain('pageRestoreGeneration,\n    fetchPaginatedDocuments')
   })
 
   test('the initial document state is distinct from a confirmed empty response', async () => {

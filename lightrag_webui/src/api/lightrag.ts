@@ -311,6 +311,26 @@ export type DocStatusResponse = {
   file_path: string
 }
 
+export type DuplicateDocumentGroup = {
+  original: DocStatusResponse
+  duplicate_count: number
+  duplicate_doc_ids: string[]
+  duplicates: DocStatusResponse[]
+}
+
+export type DuplicateDocumentsResponse = {
+  groups: DuplicateDocumentGroup[]
+  total_groups: number
+  total_duplicates: number
+}
+
+export type DismissDuplicateDocumentsResponse = {
+  status: 'success'
+  cleared: number
+  already_cleared: number
+  not_found: number
+}
+
 export type TrackStatusResponse = {
   track_id: string
   documents: DocStatusResponse[]
@@ -1057,6 +1077,20 @@ export const deleteDocuments = async (
 ): Promise<DeleteDocResponse> => {
   const response = await axiosInstance.delete('/documents/delete_document', {
     data: { doc_ids: docIds, delete_file: deleteFile, delete_llm_cache: deleteLLMCache }
+  })
+  return response.data
+}
+
+export const getDuplicateDocuments = async (): Promise<DuplicateDocumentsResponse> => {
+  const response = await axiosInstance.get('/documents/duplicates')
+  return response.data
+}
+
+export const dismissDuplicateDocuments = async (
+  originalDocIds: string[]
+): Promise<DismissDuplicateDocumentsResponse> => {
+  const response = await axiosInstance.post('/documents/duplicates/dismiss', {
+    original_doc_ids: originalDocIds
   })
   return response.data
 }

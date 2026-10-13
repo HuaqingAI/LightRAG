@@ -419,6 +419,25 @@ DUPLICATE_DEMOTION_METADATA_KEYS: tuple[str, ...] = (
     "duplicate_kind",
     "original_doc_id",
 )
+# Retryable duplicate rows are created only by the WebUI upload path when a
+# same-name primary already exists but the new upload payload is kept for a
+# later manual scan/retry.
+DUPLICATE_RETRYABLE_METADATA_KEY = "duplicate_retryable"
+DUPLICATE_DISMISSED_METADATA_KEY = "duplicate_dismissed"
+DUPLICATE_DISMISSED_AT_METADATA_KEY = "duplicate_dismissed_at"
+DUPLICATE_DISMISSED_REASON_METADATA_KEY = "duplicate_dismiss_reason"
+DUPLICATE_DISMISSED_REASON_USER_CLEAR = "user_clear"
+DUPLICATE_RETRYABLE_CLEAR_KEYS: tuple[str, ...] = (
+    "is_duplicate",
+    "duplicate_kind",
+    "original_doc_id",
+    "original_track_id",
+    DUPLICATE_RETRYABLE_METADATA_KEY,
+    DUPLICATE_DISMISSED_METADATA_KEY,
+    DUPLICATE_DISMISSED_AT_METADATA_KEY,
+    DUPLICATE_DISMISSED_REASON_METADATA_KEY,
+)
+INTERNAL_UPLOAD_STAGING_PREFIX = "__lightrag_upload_"
 # Prefix marking a doc_status content_summary as GENERATED from a file
 # extraction error (enqueue-time error documents and parse-stage FAILED
 # upserts). Doubles as the match sentinel that lets a later failure replace

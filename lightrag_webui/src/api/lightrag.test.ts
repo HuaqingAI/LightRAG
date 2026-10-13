@@ -278,6 +278,72 @@ describe('getDocumentsPaginated', () => {
   })
 })
 
+describe('duplicate document endpoints', () => {
+  test('fetches retryable duplicate groups', async () => {
+    try {
+      apiModule.__setAxiosAdapterForTests(async (config: any) => {
+        expect(config.method).toBe('get')
+        expect(config.url).toBe('/documents/duplicates')
+        return {
+          data: {
+            groups: [],
+            total_groups: 0,
+            total_duplicates: 0
+          },
+          status: 200,
+          statusText: 'OK',
+          headers: { 'content-type': 'application/json' },
+          config
+        }
+      })
+
+      await expect(apiModule.getDuplicateDocuments()).resolves.toEqual({
+        groups: [],
+        total_groups: 0,
+        total_duplicates: 0
+      })
+    } finally {
+      apiModule.__setAxiosAdapterForTests(undefined)
+    }
+  })
+
+  test('dismisses duplicate groups by original document id', async () => {
+    try {
+      apiModule.__setAxiosAdapterForTests(async (config: any) => {
+        expect(config.method).toBe('post')
+        expect(config.url).toBe('/documents/duplicates/dismiss')
+        const payload = typeof config.data === 'string'
+          ? JSON.parse(config.data)
+          : config.data
+        expect(payload).toEqual({
+          original_doc_ids: ['doc-old']
+        })
+        return {
+          data: {
+            status: 'success',
+            cleared: 1,
+            already_cleared: 0,
+            not_found: 0
+          },
+          status: 200,
+          statusText: 'OK',
+          headers: { 'content-type': 'application/json' },
+          config
+        }
+      })
+
+      await expect(apiModule.dismissDuplicateDocuments(['doc-old'])).resolves.toEqual({
+        status: 'success',
+        cleared: 1,
+        already_cleared: 0,
+        not_found: 0
+      })
+    } finally {
+      apiModule.__setAxiosAdapterForTests(undefined)
+    }
+  })
+})
+
 describe('isUserAbortError', () => {
   // Regression: the Stop button must suppress query cancellation everywhere it
   // surfaces — both the main stream catch and the guest-token retry catch (which

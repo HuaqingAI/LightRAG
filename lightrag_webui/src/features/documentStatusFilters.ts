@@ -1,7 +1,7 @@
 import type { DocStatus, DocumentsRequest } from '@/api/lightrag'
 
 export type StatusBucket = 'completed' | 'parse' | 'analyze' | 'process' | 'failed'
-export type StatusFilter = StatusBucket | 'all'
+export type StatusFilter = StatusBucket | 'all' | 'duplicates'
 
 // Each filter bucket maps to exactly one DocStatus. `pending` and the deprecated
 // `preprocessed` intentionally have no dedicated bucket — they only surface under
@@ -17,7 +17,7 @@ const BUCKET_TO_STATUS: Record<StatusBucket, DocStatus> = {
 export const getStatusRequestFilters = (
   statusFilter: StatusFilter
 ): Pick<DocumentsRequest, 'status_filter' | 'status_filters'> => {
-  if (statusFilter === 'all') {
+  if (statusFilter === 'all' || statusFilter === 'duplicates') {
     return {
       status_filter: null,
       status_filters: null

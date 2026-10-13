@@ -23,6 +23,7 @@ import {
   Dialog,
   DialogContent,
   DialogDescription,
+  DialogFooter,
   DialogHeader,
   DialogTitle,
   DialogTrigger
@@ -32,9 +33,12 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/comp
 import {
   scanNewDocuments,
   getDocumentsPaginatedWithTimeout,
+  getDuplicateDocuments,
+  dismissDuplicateDocuments,
   DocStatus,
   DocStatusResponse,
   DocumentsRequest,
+  DuplicateDocumentsResponse,
   PaginatedDocsResponse,
   PaginationInfo
 } from '@/api/lightrag'
@@ -43,7 +47,7 @@ import { toast } from 'sonner'
 import { useBackendState } from '@/stores/state'
 import { copyToClipboard } from '@/utils/clipboard'
 
-import { RefreshCwIcon, ActivityIcon, ArrowUpIcon, ArrowDownIcon, RotateCcwIcon, CheckSquareIcon, XIcon, AlertTriangle, Info, CopyIcon, SearchIcon } from 'lucide-react'
+import { RefreshCwIcon, ActivityIcon, ArrowUpIcon, ArrowDownIcon, RotateCcwIcon, CheckSquareIcon, XIcon, AlertTriangle, Info, CopyIcon, SearchIcon, UnlinkIcon } from 'lucide-react'
 import PipelineStatusDialog from '@/components/documents/PipelineStatusDialog'
 import {
   getStatusRequestFilters,
@@ -376,6 +380,79 @@ type RefreshRequest =
  */
 const DOCUMENT_REFRESH_FAILURE_TOAST_ID = 'document-refresh-failed'
 
+const createInitialPageByStatus = (): Record<StatusFilter, number> => ({
+  all: 1,
+  completed: 1,
+  parse: 1,
+  analyze: 1,
+  process: 1,
+  failed: 1,
+  duplicates: 1
+})
+
+const toComparableDocumentValue = (
+  doc: DocStatusResponse,
+  sortField: SortField
+): string | number => {
+  if (sortField === 'created_at' || sortField === 'updated_at') {
+    const timestamp = new Date(doc[sortField]).getTime()
+    return Number.isNaN(timestamp) ? 0 : timestamp
+  }
+
+  return String(doc[sortField] ?? '')
+}
+
+const buildDuplicateDocumentsPageResponse = (
+  duplicateResponse: DuplicateDocumentsResponse,
+  query: QuerySnapshot,
+  requestedPage: number,
+  statusCounts: Record<string, number>
+): PaginatedDocsResponse => {
+  const trimmedFilter = query.fileNameFilter.trim().toLowerCase()
+  const filteredDocs = duplicateResponse.groups
+    .map(group => group.original)
+    .filter(doc => {
+      if (!trimmedFilter) return true
+
+      return [doc.file_path, doc.id]
+        .some(value => String(value ?? '').toLowerCase().includes(trimmedFilter))
+    })
+    .sort((left, right) => {
+      const leftValue = toComparableDocumentValue(left, query.sortField)
+      const rightValue = toComparableDocumentValue(right, query.sortField)
+      const direction = query.sortDirection === 'asc' ? 1 : -1
+
+      if (typeof leftValue === 'number' && typeof rightValue === 'number') {
+        return (leftValue - rightValue) * direction
+      }
+
+      return String(leftValue).localeCompare(String(rightValue)) * direction
+    })
+
+  const totalCount = filteredDocs.length
+  const totalPages = totalCount === 0 ? 0 : Math.ceil(totalCount / query.pageSize)
+  const page = totalPages === 0
+    ? 1
+    : Math.min(Math.max(1, requestedPage), totalPages)
+  const start = (page - 1) * query.pageSize
+
+  return {
+    documents: filteredDocs.slice(start, start + query.pageSize),
+    pagination: {
+      page,
+      page_size: query.pageSize,
+      total_count: totalCount,
+      total_pages: totalPages,
+      has_next: totalPages > 0 && page < totalPages,
+      has_prev: totalPages > 0 && page > 1
+    },
+    status_counts: {
+      ...statusCounts,
+      duplicates: duplicateResponse.total_groups
+    }
+  }
+}
+
 export default function DocumentManager() {
   // Track component mount status
   const isMountedRef = useRef(true);
@@ -445,17 +522,14 @@ export default function DocumentManager() {
   const [fileNameFilter, setFileNameFilter] = useState('')
 
   // State to store page number for each status filter
-  const [pageByStatus, setPageByStatus] = useState<Record<StatusFilter, number>>({
-    all: 1,
-    completed: 1,
-    parse: 1,
-    analyze: 1,
-    process: 1,
-    failed: 1,
-  });
+  const [pageByStatus, setPageByStatus] = useState<Record<StatusFilter, number>>(
+    () => createInitialPageByStatus()
+  );
 
   // State for document selection
   const [selectedDocIds, setSelectedDocIds] = useState<string[]>([])
+  const [dismissDialogOpen, setDismissDialogOpen] = useState(false)
+  const [isDismissingDuplicates, setIsDismissingDuplicates] = useState(false)
   const isSelectionMode = selectedDocIds.length > 0
 
   // Add refs to track previous pipelineActive state and current interval
@@ -496,6 +570,7 @@ export default function DocumentManager() {
   // Handle deselect all documents
   const handleDeselectAll = useCallback(() => {
     setSelectedDocIds([])
+    setDismissDialogOpen(false)
   }, [])
 
   // Handle sort column click
@@ -516,14 +591,7 @@ export default function DocumentManager() {
     setPagination(prev => ({ ...prev, page: 1 }));
 
     // Reset all status filters' page memory since sorting affects all
-    setPageByStatus({
-      all: 1,
-      completed: 1,
-      parse: 1,
-      analyze: 1,
-      process: 1,
-      failed: 1,
-    });
+    setPageByStatus(createInitialPageByStatus());
   };
 
   // Define a new type that includes status information
@@ -638,6 +706,8 @@ export default function DocumentManager() {
   const analyzeCount = getCountValue(statusCounts, 'ANALYZING', 'analyzing');
   const processCount = getCountValue(statusCounts, 'PROCESSING', 'processing');
   const failedCount = getCountValue(statusCounts, 'FAILED', 'failed');
+  const duplicateCount = getCountValue(statusCounts, 'duplicates');
+  const isDuplicateFilter = statusFilter === 'duplicates';
 
   // Previous status-count digest. `null` means "no snapshot observed yet",
   // which is distinct from a digest that happens to be empty — see the effect
@@ -692,7 +762,10 @@ export default function DocumentManager() {
   const updateComponentState = useCallback((response: any, page: number) => {
     setPagination({ ...response.pagination, page });
     setCurrentPageDocs(response.documents);
-    setStatusCounts(response.status_counts);
+    setStatusCounts(prev => ({
+      ...response.status_counts,
+      duplicates: getCountValue(prev, 'duplicates')
+    }));
   }, []);
 
   const markDocumentsLoaded = useCallback(() => {
@@ -740,6 +813,21 @@ export default function DocumentManager() {
     circuitBreakerRef.current = resetCircuitBreaker();
   }, []);
 
+  const refreshDuplicateCount = useCallback(async () => {
+    try {
+      const response = await getDuplicateDocuments()
+
+      if (!isMountedRef.current) return
+
+      setStatusCounts(prev => ({
+        ...prev,
+        duplicates: response.total_groups
+      }))
+    } catch (err) {
+      console.warn('Failed to refresh duplicate document count:', err)
+    }
+  }, [])
+
   // Return the half-open probe slot for an outcome that proves nothing about
   // reachability. Idempotent, so it can be called unconditionally from the one
   // place every request path passes through.
@@ -758,14 +846,7 @@ export default function DocumentManager() {
     setDocumentsPageSize(newPageSize);
 
     // Reset all status filters to page 1 when page size changes
-    setPageByStatus({
-      all: 1,
-      completed: 1,
-      parse: 1,
-      analyze: 1,
-      process: 1,
-      failed: 1,
-    });
+    setPageByStatus(createInitialPageByStatus());
 
     setPagination(prev => ({ ...prev, page: 1, page_size: newPageSize }));
   }, [pagination.page_size, setDocumentsPageSize]);
@@ -796,6 +877,38 @@ export default function DocumentManager() {
         return response
       }
 
+      const fetchDuplicatePage = async (
+        page: number
+      ): Promise<PaginatedDocsResponse> => {
+        const response = await getDuplicateDocuments()
+        recordSuccess()
+        toast.dismiss(DOCUMENT_REFRESH_FAILURE_TOAST_ID)
+        return buildDuplicateDocumentsPageResponse(
+          response,
+          query,
+          page,
+          statusCountsRef.current
+        )
+      }
+
+      if (query.statusFilter === 'duplicates') {
+        const duplicatePage = refreshRequest.type === 'manual' ? 1 : query.page
+        const response = await fetchDuplicatePage(duplicatePage)
+
+        if (!isMountedRef.current || isStaleRequest()) return;
+
+        setPageByStatus(prev => (
+          prev.duplicates === response.pagination.page
+            ? prev
+            : { ...prev, duplicates: response.pagination.page }
+        ));
+        setPagination(response.pagination);
+        setCurrentPageDocs(response.documents);
+        setStatusCounts(response.status_counts);
+        markDocumentsLoaded()
+        return
+      }
+
       if (refreshRequest.type === 'manual') {
         const request = buildDocumentsRequest(query, 1)
         const response = await fetchPage(request)
@@ -809,8 +922,12 @@ export default function DocumentManager() {
           // updateComponentState — the page shown is the page asked for.
           setPagination({ ...response.pagination, page: 1 });
           setCurrentPageDocs(response.documents);
-          setStatusCounts(response.status_counts);
+          setStatusCounts(prev => ({
+            ...response.status_counts,
+            duplicates: getCountValue(prev, 'duplicates')
+          }));
           markDocumentsLoaded()
+          void refreshDuplicateCount()
         }
       } else {
         const { customTimeout } = refreshRequest;
@@ -836,6 +953,7 @@ export default function DocumentManager() {
             // to the corrected page.
             updateComponentState(lastPageResponse, lastPage);
             markDocumentsLoaded()
+            void refreshDuplicateCount()
             return;
           }
         }
@@ -847,6 +965,7 @@ export default function DocumentManager() {
         ));
         updateComponentState(response, pageToFetch);
         markDocumentsLoaded()
+        void refreshDuplicateCount()
       }
 
     } catch (err) {
@@ -928,7 +1047,8 @@ export default function DocumentManager() {
     settleProbe,
     handlePageSizeChange,
     buildDocumentsRequest,
-    markDocumentsLoaded
+    markDocumentsLoaded,
+    refreshDuplicateCount
   ]);
 
   // One queue for the component's lifetime: it owns the in-flight/pending
@@ -1309,14 +1429,7 @@ export default function DocumentManager() {
     if (nextFilter === fileNameFilter) return
 
     setFileNameFilter(nextFilter)
-    setPageByStatus({
-      all: 1,
-      completed: 1,
-      parse: 1,
-      analyze: 1,
-      process: 1,
-      failed: 1,
-    })
+    setPageByStatus(createInitialPageByStatus())
     setPagination(prev => ({ ...prev, page: 1 }))
     setSelectedDocIds([])
   }, [fileNameFilter, fileNameInput])
@@ -1326,14 +1439,7 @@ export default function DocumentManager() {
     if (fileNameFilter === '') return
 
     setFileNameFilter('')
-    setPageByStatus({
-      all: 1,
-      completed: 1,
-      parse: 1,
-      analyze: 1,
-      process: 1,
-      failed: 1,
-    })
+    setPageByStatus(createInitialPageByStatus())
     setPagination(prev => ({ ...prev, page: 1 }))
     setSelectedDocIds([])
   }, [fileNameFilter])
@@ -1353,6 +1459,37 @@ export default function DocumentManager() {
     startPollingInterval(2000)
   }, [refreshDocumentsThrottled, startPollingInterval])
 
+  const handleDismissDuplicateDocuments = useCallback(async () => {
+    if (selectedDocIds.length === 0) return
+
+    setIsDismissingDuplicates(true)
+    try {
+      const result = await dismissDuplicateDocuments(selectedDocIds)
+
+      if (result.cleared > 0) {
+        toast.success(t('documentPanel.documentManager.duplicates.dismissSuccess', {
+          count: result.cleared
+        }))
+      } else if (result.already_cleared > 0) {
+        toast.message(t('documentPanel.documentManager.duplicates.dismissAlreadyCleared', {
+          count: result.already_cleared
+        }))
+      } else {
+        toast.message(t('documentPanel.documentManager.duplicates.dismissNoop'))
+      }
+
+      setSelectedDocIds([])
+      setDismissDialogOpen(false)
+      refreshDocumentsThrottled({ auto: false })
+    } catch (err) {
+      toast.error(t('documentPanel.documentManager.duplicates.dismissFailed', {
+        error: errorMessage(err)
+      }))
+    } finally {
+      setIsDismissingDuplicates(false)
+    }
+  }, [refreshDocumentsThrottled, selectedDocIds, t])
+
   // Handle documents cleared callback with proper interval reset
   const handleDocumentsCleared = useCallback(async () => {
     // Clear current polling interval
@@ -1367,7 +1504,8 @@ export default function DocumentManager() {
       analyzing: 0,
       processing: 0,
       pending: 0,
-      failed: 0
+      failed: 0,
+      duplicates: 0
     });
 
     // Perform one immediate refresh to confirm clear operation
@@ -1423,6 +1561,7 @@ export default function DocumentManager() {
       sortDirection
     })
     setSelectedDocIds([])
+    setDismissDialogOpen(false)
   }
 
   // Central effect to handle all data fetching - genuine side effect (network call)
@@ -1493,7 +1632,58 @@ export default function DocumentManager() {
               <DeleteDocumentsDialog
                 selectedDocIds={selectedDocIds}
                 onDocumentsDeleted={handleDocumentsDeleted}
+                forceDeleteFile={isDuplicateFilter}
+                forceDeleteLLMCache={isDuplicateFilter}
+                buttonLabel={isDuplicateFilter ? t('documentPanel.documentManager.duplicates.deleteOldButton') : undefined}
+                tooltip={isDuplicateFilter ? t('documentPanel.documentManager.duplicates.deleteOldTooltip') : undefined}
+                description={isDuplicateFilter ? t('documentPanel.documentManager.duplicates.deleteOldDescription', { count: selectedDocIds.length }) : undefined}
+                warning={isDuplicateFilter ? t('documentPanel.documentManager.duplicates.deleteOldWarning') : undefined}
               />
+            )}
+            {isSelectionMode && isDuplicateFilter && (
+              <Dialog open={dismissDialogOpen} onOpenChange={setDismissDialogOpen}>
+                <DialogTrigger asChild>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    side="bottom"
+                    tooltip={t('documentPanel.documentManager.duplicates.dismissTooltip')}
+                    disabled={isDismissingDuplicates}
+                  >
+                    <UnlinkIcon className="h-4 w-4" />
+                    {t('documentPanel.documentManager.duplicates.dismissButton')}
+                  </Button>
+                </DialogTrigger>
+                <DialogContent className="sm:max-w-xl" onCloseAutoFocus={(e) => e.preventDefault()}>
+                  <DialogHeader>
+                    <DialogTitle>{t('documentPanel.documentManager.duplicates.dismissTitle')}</DialogTitle>
+                    <DialogDescription className="pt-2">
+                      {t('documentPanel.documentManager.duplicates.dismissDescription', { count: selectedDocIds.length })}
+                    </DialogDescription>
+                  </DialogHeader>
+                  <div className="rounded-md border border-yellow-300 bg-yellow-50 p-3 text-sm text-yellow-900 dark:border-yellow-800 dark:bg-yellow-950/40 dark:text-yellow-100">
+                    {t('documentPanel.documentManager.duplicates.dismissWarning')}
+                  </div>
+                  <DialogFooter>
+                    <Button
+                      variant="outline"
+                      disabled={isDismissingDuplicates}
+                      onClick={() => setDismissDialogOpen(false)}
+                    >
+                      {t('common.cancel')}
+                    </Button>
+                    <Button
+                      variant="default"
+                      onClick={handleDismissDuplicateDocuments}
+                      disabled={isDismissingDuplicates}
+                    >
+                      {isDismissingDuplicates
+                        ? t('documentPanel.documentManager.duplicates.dismissing')
+                        : t('documentPanel.documentManager.duplicates.dismissConfirm')}
+                    </Button>
+                  </DialogFooter>
+                </DialogContent>
+              </Dialog>
             )}
             {isSelectionMode && hasCurrentPageSelection ? (
               (() => {
@@ -1602,6 +1792,18 @@ export default function DocumentManager() {
                     )}
                   >
                     {t('documentPanel.documentManager.filters.failed')} ({failedCount})
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant={statusFilter === 'duplicates' ? 'secondary' : 'outline'}
+                    onClick={() => handleStatusFilterChange('duplicates')}
+                    disabled={isRefreshing}
+                    className={cn(
+                      duplicateCount > 0 ? 'text-orange-600' : 'text-gray-500',
+                      statusFilter === 'duplicates' && 'bg-orange-100 dark:bg-orange-900/30 font-medium border border-orange-400 dark:border-orange-600 shadow-sm'
+                    )}
+                  >
+                    {t('documentPanel.documentManager.filters.duplicates')} ({duplicateCount})
                   </Button>
                 </div>
                 <Button

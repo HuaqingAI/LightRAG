@@ -78,6 +78,14 @@ async def _await_managed(managed_tasks):
             pass
 
 
+def _staged_uploads(input_dir: Path) -> list[Path]:
+    return sorted(
+        path
+        for path in input_dir.iterdir()
+        if _document_routes.is_internal_upload_staging_file(path.name)
+    )
+
+
 @pytest.fixture(autouse=True)
 def _ensure_shared_storage_initialized():
     """Initialize the shared_storage module-level dicts before each test.
@@ -128,12 +136,14 @@ class _FakeRag:
         input,
         ids=None,
         file_paths=None,
+        source_files=None,
         track_id=None,
         docs_format=None,
         parse_engine=None,
         process_options=None,
         chunk_options=None,
         from_scan=False,
+        retryable_duplicate_source=None,
     ):
         item = {
             "input": input,
@@ -145,6 +155,10 @@ class _FakeRag:
             "chunk_options": chunk_options,
             "from_scan": from_scan,
         }
+        if source_files is not None:
+            item["source_file"] = source_files
+        if retryable_duplicate_source is not None:
+            item["retryable_duplicate_source"] = retryable_duplicate_source
         self.enqueued.append(item)
         return track_id
 
@@ -303,11 +317,13 @@ class _ScanRag:
         input,
         ids=None,
         file_paths=None,
+        source_files=None,
         track_id=None,
         docs_format=None,
         parse_engine=None,
         process_options=None,
         from_scan=False,
+        retryable_duplicate_source=None,
     ):
         item = {
             "input": input,
@@ -318,6 +334,10 @@ class _ScanRag:
             "process_options": process_options,
             "from_scan": from_scan,
         }
+        if source_files is not None:
+            item["source_file"] = source_files
+        if retryable_duplicate_source is not None:
+            item["retryable_duplicate_source"] = retryable_duplicate_source
         self.enqueued.append(item)
         return track_id
 
@@ -343,6 +363,19 @@ class _DuplicateUploadRag:
         self.workspace = f"upload-test-{uuid4().hex}"
         self.chunking_func = chunking_func
         self.addon_params = {}
+        self.enqueued = []
+        self.errors = []
+        self.process_calls = 0
+
+    async def apipeline_enqueue_documents(self, input, **kwargs):
+        self.enqueued.append({"input": input, **kwargs})
+        return kwargs.get("track_id")
+
+    async def apipeline_enqueue_error_documents(self, error_files, track_id=None):
+        self.errors.append((error_files, track_id))
+
+    async def apipeline_process_enqueue_documents(self):
+        self.process_calls += 1
 
 
 class _DeleteDocStatus:
@@ -1227,7 +1260,7 @@ async def test_scan_resume_runs_when_all_new_files_fail_to_enqueue(
     assert new_file.exists()
 
 
-async def test_upload_rejects_same_name_failed_doc_status_without_full_docs(
+async def test_upload_accepts_same_name_failed_doc_status_into_staging(
     tmp_path, monkeypatch
 ):
     # Other tests (e.g. test_auth.py) may replace global_args with a SimpleNamespace
@@ -1257,18 +1290,23 @@ async def test_upload_rejects_same_name_failed_doc_status_without_full_docs(
         file=BytesIO(b"replacement docx bytes"),
     )
 
-    # Strict name pre-check: same-canonical record in doc_status now raises 409
-    # rather than returning a "duplicated" 200 response.  Clients must delete
-    # the existing record before re-uploading.
-    with pytest.raises(_document_routes.HTTPException) as excinfo:
-        await upload_endpoint(set(), upload_file)
-    assert excinfo.value.status_code == 409
-    assert "failed.docx" in excinfo.value.detail
-    assert "Status: failed" in excinfo.value.detail
+    managed: set = set()
+    response = await upload_endpoint(managed, upload_file)
+    await _await_managed(managed)
+
+    assert response.status == "success"
     assert not (tmp_path / "failed.docx").exists()
+    staged_files = _staged_uploads(tmp_path)
+    assert len(staged_files) == 1
+    assert staged_files[0].name.endswith("__failed.docx")
+    assert rag.enqueued[0]["file_paths"] == "failed.docx"
+    assert rag.enqueued[0]["source_files"] == staged_files[0].name
+    assert rag.enqueued[0]["retryable_duplicate_source"] == "webui_upload"
 
 
-async def test_upload_rejects_parser_hinted_filesystem_duplicate(tmp_path, monkeypatch):
+async def test_upload_accepts_parser_hinted_filesystem_duplicate_into_staging(
+    tmp_path, monkeypatch
+):
     monkeypatch.setattr(
         _document_routes, "global_args", SimpleNamespace(max_upload_size=None)
     )
@@ -1286,13 +1324,18 @@ async def test_upload_rejects_parser_hinted_filesystem_duplicate(tmp_path, monke
         file=BytesIO(b"replacement docx bytes"),
     )
 
-    # Strict name pre-check: an INPUT directory file with the same canonical
-    # basename now blocks the upload with 409.
-    with pytest.raises(_document_routes.HTTPException) as excinfo:
-        await upload_endpoint(set(), upload_file)
-    assert excinfo.value.status_code == 409
-    assert "existing.docx" in excinfo.value.detail
+    managed: set = set()
+    response = await upload_endpoint(managed, upload_file)
+    await _await_managed(managed)
+
+    assert response.status == "success"
+    assert (tmp_path / "existing.docx").read_bytes() == b"existing docx bytes"
     assert not (tmp_path / "existing.[native].docx").exists()
+    staged_files = _staged_uploads(tmp_path)
+    assert len(staged_files) == 1
+    assert staged_files[0].name.endswith("__existing.[native].docx")
+    assert rag.enqueued[0]["file_paths"] == "existing.[native].docx"
+    assert rag.enqueued[0]["source_files"] == staged_files[0].name
 
 
 async def test_upload_opener_construction_failure_returns_500_not_409(
@@ -1480,7 +1523,9 @@ async def test_upload_accepts_c_when_custom_callback_is_injected(tmp_path, monke
     shared_storage = importlib.import_module("lightrag.kg.shared_storage")
     await shared_storage.initialize_pipeline_status(workspace=rag.workspace)
 
-    async def _no_op_index(rag_arg, file_path, track_id=None, admission_token=None):
+    async def _no_op_index(
+        rag_arg, file_path, track_id=None, admission_token=None, **kwargs
+    ):
         return None
 
     monkeypatch.setattr(_document_routes, "pipeline_index_file", _no_op_index)
@@ -1500,7 +1545,8 @@ async def test_upload_accepts_c_when_custom_callback_is_injected(tmp_path, monke
     await _await_managed(managed)
 
     assert response.status == "success"
-    assert (tmp_path / "custom.[native-C].docx").exists()
+    assert not (tmp_path / "custom.[native-C].docx").exists()
+    assert len(_staged_uploads(tmp_path)) == 1
 
 
 async def test_upload_succeeds_concurrent_with_pipeline_busy(tmp_path, monkeypatch):
@@ -1545,7 +1591,9 @@ async def test_upload_succeeds_concurrent_with_pipeline_busy(tmp_path, monkeypat
 
     gate = asyncio.Event()
 
-    async def _gated_index(rag_arg, file_path, track_id=None, admission_token=None):
+    async def _gated_index(
+        rag_arg, file_path, track_id=None, admission_token=None, **kwargs
+    ):
         await gate.wait()
 
     monkeypatch.setattr(_document_routes, "pipeline_index_file", _gated_index)
@@ -1555,7 +1603,8 @@ async def test_upload_succeeds_concurrent_with_pipeline_busy(tmp_path, monkeypat
 
     # Endpoint accepted the upload despite busy=True.
     assert response.status == "success"
-    assert (tmp_path / "while_busy.docx").exists()
+    assert not (tmp_path / "while_busy.docx").exists()
+    assert len(_staged_uploads(tmp_path)) == 1
     # The slot has been transferred to the managed task, which is parked in the
     # gated child; until it finishes pending_enqueues stays at 1 so a concurrent
     # /scan would refuse.
@@ -1688,7 +1737,9 @@ async def test_upload_succeeds_during_scan_processing_phase(tmp_path, monkeypatc
 
     gate = asyncio.Event()
 
-    async def _gated_index(rag_arg, file_path, track_id=None, admission_token=None):
+    async def _gated_index(
+        rag_arg, file_path, track_id=None, admission_token=None, **kwargs
+    ):
         await gate.wait()
 
     monkeypatch.setattr(_document_routes, "pipeline_index_file", _gated_index)
@@ -1698,7 +1749,8 @@ async def test_upload_succeeds_during_scan_processing_phase(tmp_path, monkeypatc
 
     # Endpoint accepted the upload despite scan in progress.
     assert response.status == "success"
-    assert (tmp_path / "upload_during_scan_processing.docx").exists()
+    assert not (tmp_path / "upload_during_scan_processing.docx").exists()
+    assert len(_staged_uploads(tmp_path)) == 1
     assert pipeline_status["pending_enqueues"] == 1
     assert len(managed) == 1
 
@@ -2621,7 +2673,9 @@ async def test_two_concurrent_uploads_both_succeed_when_pipeline_busy(
 
     gate = asyncio.Event()
 
-    async def _gated_index(rag_arg, file_path, track_id=None, admission_token=None):
+    async def _gated_index(
+        rag_arg, file_path, track_id=None, admission_token=None, **kwargs
+    ):
         await gate.wait()
 
     monkeypatch.setattr(_document_routes, "pipeline_index_file", _gated_index)
@@ -2638,9 +2692,10 @@ async def test_two_concurrent_uploads_both_succeed_when_pipeline_busy(
     assert response_b.status == "success"
     # Both reservations coexist while the gated managed tasks run.
     assert pipeline_status["pending_enqueues"] == 2
-    # Both files were written to disk; both managed tasks tracked.
-    assert (tmp_path / "a.docx").exists()
-    assert (tmp_path / "b.docx").exists()
+    # Both files were written to unique staging paths; both managed tasks tracked.
+    assert not (tmp_path / "a.docx").exists()
+    assert not (tmp_path / "b.docx").exists()
+    assert len(_staged_uploads(tmp_path)) == 2
     assert len(managed) == 2
 
     # Let both finish; each child's finally releases its slot.
@@ -3034,7 +3089,9 @@ async def test_upload_managed_task_released_on_shutdown_drain(tmp_path, monkeypa
 
     gate = asyncio.Event()
 
-    async def _gated_index(rag_arg, file_path, track_id=None, admission_token=None):
+    async def _gated_index(
+        rag_arg, file_path, track_id=None, admission_token=None, **kwargs
+    ):
         await gate.wait()
 
     monkeypatch.setattr(_document_routes, "pipeline_index_file", _gated_index)

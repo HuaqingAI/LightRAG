@@ -29,4 +29,20 @@ describe('DeleteDocumentsDialog defaults', () => {
     expect(await screen.findByRole('checkbox', { name: strings.deleteFileOption })).toBeChecked()
     expect(screen.getByRole('checkbox', { name: strings.deleteLLMCacheOption })).toBeChecked()
   })
+
+  test('hides optional deletion controls in forced mode', async () => {
+    const user = userEvent.setup()
+    renderWithProviders(
+      <DeleteDocumentsDialog
+        selectedDocIds={['doc-1']}
+        forceDeleteFile
+        forceDeleteLLMCache
+      />
+    )
+
+    await user.click(screen.getByRole('button', { name: strings.button }))
+
+    expect(screen.queryAllByRole('checkbox', { name: strings.deleteFileOption })).toHaveLength(0)
+    expect(screen.queryAllByRole('checkbox', { name: strings.deleteLLMCacheOption })).toHaveLength(0)
+  })
 })

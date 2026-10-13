@@ -26,8 +26,12 @@ describe('documentStatusFilters', () => {
     })
   })
 
-  test('builds empty request filters for the all tab', () => {
+  test('builds empty request filters for non-status tabs', () => {
     expect(getStatusRequestFilters('all')).toEqual({
+      status_filter: null,
+      status_filters: null
+    })
+    expect(getStatusRequestFilters('duplicates')).toEqual({
       status_filter: null,
       status_filters: null
     })

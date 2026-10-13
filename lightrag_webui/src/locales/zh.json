@@ -153,7 +153,25 @@
         "parse": "文件解析",
         "analyze": "模态分析",
         "process": "图谱处理",
-        "failed": "失败"
+        "failed": "失败",
+        "duplicates": "重复文档"
+      },
+      "duplicates": {
+        "deleteOldButton": "删除旧文档",
+        "deleteOldTooltip": "删除选中的旧文档，并强制清理上传文件和 LLM 缓存",
+        "deleteOldDescription": "此操作将永久删除选中的 {{count}} 个旧文档，并为同名新文档释放重试条件。",
+        "deleteOldWarning": "警告：此操作会删除旧文档、其上传文件以及实体关系抽取 LLM 缓存，无法恢复！",
+        "dismissButton": "清除重复项",
+        "dismissTooltip": "仅隐藏当前重复关联，不删除任何文档或文件",
+        "dismissTitle": "清除重复项",
+        "dismissDescription": "将从重复文档列表中移除选中的 {{count}} 个关联。",
+        "dismissWarning": "此操作不会删除旧文档、新上传的失败文档、上传文件、知识图谱数据或 LLM 缓存；新上传的重复文档仍会保留在失败列表中。",
+        "dismissConfirm": "清除重复项",
+        "dismissing": "正在清除...",
+        "dismissSuccess": "已清除 {{count}} 个重复项",
+        "dismissAlreadyCleared": "{{count}} 个重复项此前已清除",
+        "dismissNoop": "没有可清除的重复项",
+        "dismissFailed": "清除重复项失败\n{{error}}"
       },
       "status": {
         "all": "全部",

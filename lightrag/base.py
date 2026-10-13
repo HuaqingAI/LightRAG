@@ -1787,6 +1787,8 @@ class DeletionResult:
     status_code: int = 200
     file_path: str | None = None
     """Canonical source basename; another status row may reference it too."""
+    source_file: str | None = None
+    """Exact physical source basename for internally staged uploads."""
 
 
 # Unified Query Result Data Structures for Reference List Support

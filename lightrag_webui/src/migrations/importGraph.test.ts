@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import { readFileSync, existsSync } from 'fs'
-import { execSync } from 'child_process'
 import { dirname, join, resolve } from 'path'
+import { relativePath, sourceFiles } from '@/test/sourceScan'
 
 /**
  * Static source assertions guarding the migration module's ordering and
@@ -138,13 +138,18 @@ describe('navigation core stays graph-free', () => {
 
 describe('no path-rewriting hard navigation in the SPA', () => {
   test('frontend source contains no location.href= / location.replace( / location.assign(', () => {
-    const output = execSync(
-      String.raw`grep -rnE "location\.href\s*=|location\.replace\(|location\.assign\(" --include='*.ts' --include='*.tsx' . || true`,
-      { cwd: SRC, encoding: 'utf8' }
-    )
-    const offenders = output
-      .split('\n')
-      .filter(Boolean)
+    const hardNavigationPattern = /location\.href\s*=|location\.replace\(|location\.assign\(/
+    const offenders = sourceFiles(SRC, (file) => /\.(ts|tsx)$/.test(file))
+      .flatMap((file) =>
+        readFileSync(file, 'utf8')
+          .split(/\r?\n/)
+          .map((line, index) => ({
+            line,
+            display: `${relativePath(SRC, file)}:${index + 1}:${line}`
+          }))
+      )
+      .filter(({ line }) => hardNavigationPattern.test(line))
+      .map(({ display }) => display)
       // window.location.reload() is allowed (same-URL reload, keeps entry);
       // test files may reference these strings.
       .filter((line) => !line.includes('.test.'))

@@ -59,29 +59,120 @@ mock.module('@/lib/constants', () => ({
 // Mock axios — the module calls axios.create() at top level and
 // axios.get() in silentRefreshGuestToken
 mock.module('axios', () => {
-  const instance = {
-    get: () =>
-      Promise.resolve({
-        data: {
-          access_token: 'mock-guest-token',
-          auth_configured: false,
-          core_version: '1.0',
-          api_version: '1.0',
-        },
-        headers: {},
-      }),
-    post: () => Promise.resolve({ data: {}, headers: {} }),
-    interceptors: {
-      request: { use: () => {} },
-      response: { use: () => {} },
+  type MockConfig = {
+    method?: string
+    url?: string
+    data?: unknown
+    headers?: Record<string, string>
+    [key: string]: unknown
+  }
+  type MockResponse = {
+    data: unknown
+    status: number
+    statusText: string
+    headers: Record<string, string>
+    config: MockConfig
+  }
+
+  const requestHandlers: Array<(config: MockConfig) => MockConfig | Promise<MockConfig>> = []
+  const responseHandlers: Array<(response: MockResponse) => MockResponse | Promise<MockResponse>> = []
+  const responseErrorHandlers: Array<(error: unknown) => unknown> = []
+
+  const defaults: { adapter?: (config: MockConfig) => Promise<MockResponse> | MockResponse } = {}
+
+  const runRequestHandlers = async (config: MockConfig): Promise<MockConfig> => {
+    let next = config
+    for (const handler of requestHandlers) {
+      next = await handler(next)
+    }
+    return next
+  }
+
+  const runResponseHandlers = async (response: MockResponse): Promise<MockResponse> => {
+    let next = response
+    for (const handler of responseHandlers) {
+      next = await handler(next)
+    }
+    return next
+  }
+
+  const runResponseErrorHandlers = async (error: unknown): Promise<never> => {
+    let next = error
+    for (const handler of responseErrorHandlers) {
+      try {
+        return await handler(next) as never
+      } catch (handledError) {
+        next = handledError
+      }
+    }
+    throw next
+  }
+
+  const request = async (rawConfig: MockConfig): Promise<MockResponse> => {
+    const config = await runRequestHandlers({
+      ...rawConfig,
+      headers: { ...(rawConfig.headers ?? {}) },
+    })
+
+    try {
+      const response = defaults.adapter
+        ? await defaults.adapter(config)
+        : {
+          data: {},
+          status: 200,
+          statusText: 'OK',
+          headers: {},
+          config,
+        }
+      return await runResponseHandlers(response)
+    } catch (error) {
+      return await runResponseErrorHandlers(error)
+    }
+  }
+
+  const instance: any = (config: MockConfig) => request(config)
+  instance.defaults = defaults
+  instance.get = (url: string, config: MockConfig = {}) =>
+    request({ ...config, method: 'get', url })
+  instance.post = (url: string, data?: unknown, config: MockConfig = {}) =>
+    request({ ...config, method: 'post', url, data })
+  instance.delete = (url: string, config: MockConfig = {}) =>
+    request({ ...config, method: 'delete', url })
+  instance.interceptors = {
+    request: {
+      use: (handler: (config: MockConfig) => MockConfig | Promise<MockConfig>) => {
+        requestHandlers.push(handler)
+      },
+    },
+    response: {
+      use: (
+        handler: (response: MockResponse) => MockResponse | Promise<MockResponse>,
+        errorHandler?: (error: unknown) => unknown
+      ) => {
+        responseHandlers.push(handler)
+        if (errorHandler) {
+          responseErrorHandlers.push(errorHandler)
+        }
+      },
     },
   }
+
   // The default export from axios is the main axios function, which also has
   // .create, .get, .post, etc. as static methods.
   const axiosFn: any = () => Promise.resolve({ data: {}, headers: {} })
   axiosFn.create = () => instance
-  axiosFn.get = instance.get
+  axiosFn.get = () =>
+    Promise.resolve({
+      data: {
+        access_token: 'mock-guest-token',
+        auth_configured: false,
+        core_version: '1.0',
+        api_version: '1.0',
+      },
+      headers: {},
+    })
   axiosFn.post = instance.post
+  axiosFn.delete = instance.delete
   axiosFn.interceptors = instance.interceptors
   return { default: axiosFn, __esModule: true }
 })

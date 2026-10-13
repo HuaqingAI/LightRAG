@@ -35,10 +35,14 @@ from lightrag.base import (
     CursorPosition,
     DocProcessingStatus,
     DocStatus,
+    SourceAbsent,
     SourceConflict,
     SourceUnique,
 )
 from lightrag.constants import (
+    DUPLICATE_DISMISSED_METADATA_KEY,
+    DUPLICATE_RETRYABLE_CLEAR_KEYS,
+    DUPLICATE_RETRYABLE_METADATA_KEY,
     ENQUEUE_SERIALIZE_LOCK_NAMESPACE,
     FULL_DOCS_FORMAT_LIGHTRAG,
     FULL_DOCS_FORMAT_PENDING_PARSE,
@@ -666,6 +670,7 @@ class _PipelineMixin:
         input: str | list[str],
         ids: list[str] | None = None,
         file_paths: str | list[str] | None = None,
+        source_files: str | list[str] | None = None,
         track_id: str | None = None,
         docs_format: str = FULL_DOCS_FORMAT_RAW,
         parse_engine: str | list[str] | None = None,
@@ -673,6 +678,7 @@ class _PipelineMixin:
         chunk_options: dict | list[dict] | None = None,
         admission_token: str | None = None,
         from_scan: bool = False,
+        retryable_duplicate_source: str | None = None,
     ) -> str:
         """
         Pipeline for Processing Documents
@@ -692,6 +698,10 @@ class _PipelineMixin:
                 by design, not as an oversight. ``pending_parse`` is the
                 server upload path, which never passes ``ids``.
             file_paths: list of file paths corresponding to each document, used for citation
+            source_files: physical source basenames for pending-parse documents.
+                When omitted, the physical source is the same basename as
+                ``file_paths``. Upload uses this to keep a UUID staging file while
+                storing the canonical filename in ``file_path``.
             track_id: tracking ID for monitoring processing status
             docs_format: "raw" (default) or "pending_parse"; "pending_parse" defers
                 extraction to the parse worker (content may be empty and
@@ -741,6 +751,11 @@ class _PipelineMixin:
                 forwarded as a defence-in-depth bypass so an unexpected
                 scan-owned write inside the classification window is
                 allowed through.  External callers must leave this False.
+            retryable_duplicate_source: marker for callers that preserved the
+                physical source payload of a same-name duplicate. Only the WebUI
+                upload path sets this; eligible filename duplicates get
+                ``metadata.duplicate_retryable=true`` and keep their full_docs
+                row for a later scan/retry.
 
         Returns:
             str: tracking ID for monitoring processing status
@@ -846,6 +861,8 @@ class _PipelineMixin:
             ids = [ids]
         if isinstance(file_paths, str):
             file_paths = [file_paths]
+        if isinstance(source_files, str):
+            source_files = [source_files]
         if isinstance(parse_engine, str):
             parse_engine = [parse_engine] * len(input)
         if isinstance(process_options, str):
@@ -866,6 +883,16 @@ class _PipelineMixin:
             file_paths = [path if path else "unknown_source" for path in file_paths]
         else:
             file_paths = ["unknown_source"] * len(input)
+        if source_files is not None:
+            if len(source_files) != len(input):
+                raise ValueError(
+                    "Number of source files must match the number of documents"
+                )
+            source_files = [
+                Path(str(source or "").strip()).name for source in source_files
+            ]
+        else:
+            source_files = [Path(str(path or "").strip()).name for path in file_paths]
 
         if docs_format not in (FULL_DOCS_FORMAT_RAW, FULL_DOCS_FORMAT_PENDING_PARSE):
             raise ValueError(
@@ -1004,6 +1031,27 @@ class _PipelineMixin:
                     f"{file_path_canonical}-{track_id}-{index}", prefix="doc-"
                 )
 
+            content_data: dict[str, Any] = {
+                "content": content,
+                "file_path": file_path_canonical,
+                "parse_format": doc_format,
+            }
+            if content_hash:
+                content_data["content_hash"] = content_hash
+            if engine := _parse_engine_at(index, doc_format):
+                content_data["parse_engine"] = engine
+            if doc_format == FULL_DOCS_FORMAT_PENDING_PARSE:
+                source_file = Path(str(source_files[index] or "").strip()).name
+                if has_known_document_source(source_file):
+                    content_data["source_file"] = source_file
+            options_str = _process_options_at(index)
+            if options_str:
+                content_data["process_options"] = options_str
+            # Always snapshot chunk_options at enqueue time, independent of
+            # whether process_options selected a specific strategy, so the
+            # per-doc parameters are frozen even when ``F`` (default) is used.
+            content_data["chunk_options"] = _chunk_options_at(index)
+
             if known_source and file_path_canonical in source_to_doc_id:
                 duplicate_attempts.append(
                     {
@@ -1014,6 +1062,11 @@ class _PipelineMixin:
                         "existing_status": "batch_duplicate",
                         "existing_track_id": "",
                         "duplicate_kind": "filename",
+                        "content_data": content_data,
+                        "retryable_duplicate": bool(
+                            retryable_duplicate_source
+                            and doc_format == FULL_DOCS_FORMAT_PENDING_PARSE
+                        ),
                     }
                 )
                 return
@@ -1028,6 +1081,7 @@ class _PipelineMixin:
                         "existing_status": "batch_duplicate",
                         "existing_track_id": "",
                         "duplicate_kind": "content_hash",
+                        "content_data": content_data,
                     }
                 )
                 return
@@ -1037,27 +1091,6 @@ class _PipelineMixin:
             if content_hash:
                 content_hash_to_doc_id[content_hash] = doc_id
 
-            content_data: dict[str, Any] = {
-                "content": content,
-                "file_path": file_path_canonical,
-                "parse_format": doc_format,
-            }
-            if content_hash:
-                content_data["content_hash"] = content_hash
-            if engine := _parse_engine_at(index, doc_format):
-                content_data["parse_engine"] = engine
-            if doc_format == FULL_DOCS_FORMAT_PENDING_PARSE:
-                source_file = Path(str(file_paths[index] or "").strip()).name
-                if has_known_document_source(source_file):
-                    content_data["source_file"] = source_file
-            options_str = _process_options_at(index)
-            if options_str:
-                content_data["process_options"] = options_str
-            # Always snapshot chunk_options at enqueue time — independent
-            # of whether process_options selected a specific strategy —
-            # so the per-doc parameters are frozen even when ``F``
-            # (default) is used.
-            content_data["chunk_options"] = _chunk_options_at(index)
             contents[doc_id] = content_data
 
         # ``ids`` outranks ``docs_format`` by design: explicit ids mark the
@@ -1226,6 +1259,12 @@ class _PipelineMixin:
                                 resolution.doc, "track_id", ""
                             ),
                             "duplicate_kind": "filename",
+                            "content_data": content_data,
+                            "retryable_duplicate": bool(
+                                retryable_duplicate_source
+                                and content_data.get("parse_format")
+                                == FULL_DOCS_FORMAT_PENDING_PARSE
+                            ),
                         }
                     )
                     continue
@@ -1291,6 +1330,12 @@ class _PipelineMixin:
                             existing_doc.get("track_id", "") if existing_doc else ""
                         ),
                         "duplicate_kind": "filename",
+                        "content_data": contents.get(doc_id),
+                        "retryable_duplicate": bool(
+                            retryable_duplicate_source
+                            and contents.get(doc_id, {}).get("parse_format")
+                            == FULL_DOCS_FORMAT_PENDING_PARSE
+                        ),
                     }
                 )
 
@@ -1337,12 +1382,40 @@ class _PipelineMixin:
                         self._release_admission_reservation, minted_token
                     )
 
+            def _full_doc_payload_from_content(
+                content_data: dict[str, Any]
+            ) -> dict[str, Any]:
+                payload: dict[str, Any] = {
+                    "content": content_data.get("content", ""),
+                    "file_path": content_data["file_path"],
+                    "parse_format": content_data.get(
+                        "parse_format", FULL_DOCS_FORMAT_RAW
+                    ),
+                }
+                for key in (
+                    "content_hash",
+                    "parse_engine",
+                    "process_options",
+                    "chunk_options",
+                    "source_file",
+                ):
+                    if content_data.get(key) is not None:
+                        payload[key] = content_data[key]
+                return payload
+
+            retryable_duplicate_written = False
             if duplicate_attempts:
                 duplicate_docs: dict[str, Any] = {}
+                duplicate_full_docs: dict[str, Any] = {}
                 for index, attempt in enumerate(duplicate_attempts):
                     doc_id = attempt["doc_id"]
                     file_path = attempt.get("file_path") or "unknown_source"
                     duplicate_kind = attempt.get("duplicate_kind") or "filename"
+                    retryable_duplicate = bool(
+                        attempt.get("retryable_duplicate")
+                        and duplicate_kind == "filename"
+                        and isinstance(attempt.get("content_data"), dict)
+                    )
                     logger.warning(
                         f"Duplicate document detected ({duplicate_kind}): "
                         f"{doc_id} ({file_path})"
@@ -1385,6 +1458,26 @@ class _PipelineMixin:
                             f"[DUPLICATE:{duplicate_kind}] Original document: "
                             f"{attempt.get('original_doc_id', doc_id)}"
                         )
+                    metadata = {
+                        KG_WRITE_STATE_METADATA_KEY: KG_WRITE_STATE_PRE_GRAPH,
+                        "is_duplicate": True,
+                        "duplicate_kind": duplicate_kind,
+                        "original_doc_id": attempt.get("original_doc_id", doc_id),
+                        "original_track_id": attempt.get("existing_track_id", ""),
+                    }
+                    content_data = attempt.get("content_data")
+                    if isinstance(content_data, dict):
+                        if source_file := _read_source_file(content_data):
+                            metadata["source_file"] = source_file
+                        if content_data.get("process_options"):
+                            metadata["process_options"] = content_data[
+                                "process_options"
+                            ]
+                    if retryable_duplicate:
+                        metadata[DUPLICATE_RETRYABLE_METADATA_KEY] = True
+                        duplicate_full_docs[dup_record_id] = (
+                            _full_doc_payload_from_content(content_data)
+                        )
                     duplicate_docs[dup_record_id] = {
                         "status": DocStatus.FAILED,
                         "content_summary": summary,
@@ -1396,15 +1489,15 @@ class _PipelineMixin:
                         "file_path": file_path,
                         "track_id": track_id,  # Use current track_id for tracking
                         "error_msg": error_msg,
-                        "metadata": {
-                            "is_duplicate": True,
-                            "duplicate_kind": duplicate_kind,
-                            "original_doc_id": attempt.get("original_doc_id", doc_id),
-                            "original_track_id": attempt.get("existing_track_id", ""),
-                        },
+                        "metadata": metadata,
                     }
 
-                # Store duplicate records in doc_status
+                if duplicate_full_docs:
+                    await self.full_docs.upsert(duplicate_full_docs)
+                    await self.full_docs.index_done_callback()
+                    retryable_duplicate_written = True
+
+                # Store duplicate records in doc_status after any retry payloads.
                 if duplicate_docs:
                     await self.doc_status.upsert(duplicate_docs)
                     logger.info(
@@ -1417,6 +1510,8 @@ class _PipelineMixin:
 
             if not new_docs:
                 logger.warning("No new unique documents were found.")
+                if retryable_duplicate_written:
+                    return track_id
                 return
 
             # Ingress handle for the publishes below: a document notification
@@ -1450,6 +1545,10 @@ class _PipelineMixin:
                 if contents[doc_id].get("process_options"):
                     full_docs_data[doc_id]["process_options"] = contents[doc_id][
                         "process_options"
+                    ]
+                if contents[doc_id].get("source_file"):
+                    full_docs_data[doc_id]["source_file"] = contents[doc_id][
+                        "source_file"
                     ]
                 # ``chunk_options`` is always populated by ``_add_content``
                 # at enqueue time so it's persisted unconditionally.
@@ -2790,10 +2889,118 @@ class _PipelineMixin:
         if internal_abort:
             await self._discard_pending_index_ops()
 
+    def _is_retryable_filename_duplicate(self, status_doc: DocProcessingStatus) -> bool:
+        metadata = getattr(status_doc, "metadata", None)
+        if not isinstance(metadata, dict):
+            return False
+        return (
+            metadata.get(DUPLICATE_RETRYABLE_METADATA_KEY) is True
+            and metadata.get("is_duplicate") is True
+            and metadata.get("duplicate_kind") == "filename"
+            and metadata.get(DUPLICATE_DISMISSED_METADATA_KEY) is not True
+            and bool(metadata.get("original_doc_id"))
+        )
+
+    def _retryable_duplicate_source_exists(
+        self, status_doc: DocProcessingStatus, content_data: dict[str, Any]
+    ) -> bool:
+        source_file = _read_source_file(content_data) or _read_source_file(
+            getattr(status_doc, "metadata", None)
+        )
+        source_name = Path(str(source_file or "").strip()).name
+        if not source_name:
+            return False
+
+        input_path = input_dir_path()
+        workspace = getattr(self, "workspace", "") or ""
+        roots: list[Path] = []
+        if workspace:
+            roots.append(input_path / workspace)
+        roots.append(input_path)
+
+        cwd = Path.cwd()
+        if workspace:
+            roots.append(cwd / "inputs" / workspace)
+        roots.append(cwd / "inputs")
+
+        seen_roots: set[Path] = set()
+        for root in roots:
+            if root in seen_roots:
+                continue
+            seen_roots.add(root)
+            candidate = root / source_name
+            if candidate.exists() and candidate.is_file():
+                return True
+        return False
+
+    async def _retryable_duplicate_ready_for_reset(
+        self,
+        doc_id: str,
+        status_doc: DocProcessingStatus,
+        content_data: dict[str, Any],
+        pipeline_status: dict,
+        pipeline_status_lock,
+    ) -> bool:
+        metadata = getattr(status_doc, "metadata", None)
+        if isinstance(metadata, dict) and (
+            metadata.get(DUPLICATE_RETRYABLE_METADATA_KEY) is True
+            and metadata.get("is_duplicate") is True
+            and metadata.get("duplicate_kind") == "filename"
+            and metadata.get(DUPLICATE_DISMISSED_METADATA_KEY) is True
+        ):
+            return False
+
+        if not self._is_retryable_filename_duplicate(status_doc):
+            return True
+
+        if not isinstance(metadata, dict):
+            return False
+
+        original_doc_id = str(metadata.get("original_doc_id") or "")
+        strict_doc_status = getattr(
+            self.doc_status, "supports_strict_point_reads", False
+        )
+        if not strict_doc_status:
+            warning = (
+                "Manual retry: retryable duplicate document "
+                f"{doc_id} left FAILED because {type(self.doc_status).__name__} "
+                "cannot strictly confirm the original document is absent"
+            )
+            logger.warning(warning)
+            async with pipeline_status_lock:
+                pipeline_status["latest_message"] = warning
+                append_pipeline_history(pipeline_status, warning)
+            return False
+        original = await self.doc_status.get_by_id_strict(original_doc_id)
+        if original is not None:
+            return False
+
+        file_path = resolve_doc_file_path(
+            status_doc=status_doc, content_data=content_data
+        )
+        resolution = await self.doc_status.resolve_doc_source_strict(file_path)
+        if not isinstance(resolution, SourceAbsent):
+            return False
+
+        if not self._retryable_duplicate_source_exists(status_doc, content_data):
+            warning = (
+                "Manual retry: retryable duplicate document "
+                f"{doc_id} left FAILED because its source_file is missing"
+            )
+            logger.warning(warning)
+            async with pipeline_status_lock:
+                pipeline_status["latest_message"] = warning
+                append_pipeline_history(pipeline_status, warning)
+            return False
+
+        return True
+
     def _build_pending_reset_update(
         self,
         status_doc: DocProcessingStatus,
         content_data: dict | None,
+        *,
+        metadata_drop: tuple[str, ...] = (),
     ) -> tuple[dict, str, dict]:
         """Build the doc_status upsert that returns one interrupted/FAILED doc
         to a clean PENDING state, preserving the immutable ``created_at``.
@@ -2814,6 +3021,8 @@ class _PipelineMixin:
         # Directives-only metadata: drop per-attempt timing/result fields, keep
         # process_options / source_file (legacy source_file_name tolerant).
         reset_metadata = doc_status_reset_metadata(status_doc)
+        for key in metadata_drop:
+            reset_metadata.pop(key, None)
         update = {
             "status": DocStatus.PENDING,
             "content_summary": status_doc.content_summary,
@@ -3272,7 +3481,22 @@ class _PipelineMixin:
                     unconfirmed += 1
             if not content_data:
                 continue
-            update, _, _ = self._build_pending_reset_update(status_doc, content_data)
+            if not await self._retryable_duplicate_ready_for_reset(
+                doc_id,
+                status_doc,
+                content_data,
+                pipeline_status,
+                pipeline_status_lock,
+            ):
+                continue
+            metadata_drop = (
+                DUPLICATE_RETRYABLE_CLEAR_KEYS
+                if self._is_retryable_filename_duplicate(status_doc)
+                else ()
+            )
+            update, _, _ = self._build_pending_reset_update(
+                status_doc, content_data, metadata_drop=metadata_drop
+            )
             docs_to_reset[doc_id] = update
         if unconfirmed:
             warning = (
